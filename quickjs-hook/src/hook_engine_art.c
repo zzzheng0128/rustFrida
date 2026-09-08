@@ -1,5 +1,8 @@
 /*
- * hook_engine_art.c - ART method router: table, thunk generation, router hooks
+ * hook_engine_art.c：ART 方法调用路由及其用户态资源管理。
+ *
+ * 本文件属于运行时集成层，不是内核页表实现。路由表、生成代码和活动调用
+ * 可能具有不同生命期；修改表项或看到调试计数变化，不代表所有引用已经退出。
  *
  * Contains: ART router lookup table management, debug functions,
  * FP instruction helpers, generate_art_router_thunk, resolve_art_trampoline,
@@ -1246,7 +1249,7 @@ static void emit_art_router_quick_callback_path(Arm64Writer* w, uint64_t lbl_qui
     /* Keep SP+0 as the quick stack sentinel while the original runs.
      * The sentinel is a static native no-object-argument ArtMethod clone whose
      * quick entrypoint points at this generated thunk, so StackVisitor can use
-     * our fake header for wwb_hook_pool PCs and ReferenceMapVisitor has no
+     * our fake header for hook pool PCs and ReferenceMapVisitor has no
      * object parameters to scan from the synthetic router frame. */
     emit_restore_args_only(w);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X20, 0);

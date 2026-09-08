@@ -183,7 +183,7 @@ pub(super) fn set_stealth_mode(mode: StealthMode) {
         }
     }
 
-    output_verbose(&format!("[stealth] Java hook 模式: {}", label));
+    output_verbose(&format!("[jpatch] Java hook 模式: {}", label));
 }
 
 /// 查询当前 stealth 模式
@@ -220,7 +220,7 @@ unsafe fn try_fixup_trampoline(trampoline: *mut std::ffi::c_void, orig_addr: u64
     }
     if trampoline.is_null() {
         output_verbose(&format!(
-            "[stealth2] fixup_trampoline {:#x}: trampoline is null",
+            "[jpatch2] fixup_trampoline {:#x}: trampoline is null",
             orig_addr
         ));
         let _ = crate::recomp::try_revert_slot_patch(orig_addr as usize);
@@ -228,19 +228,19 @@ unsafe fn try_fixup_trampoline(trampoline: *mut std::ffi::c_void, orig_addr: u64
     }
     // 1. 用真正的原始指令重建 trampoline
     if let Err(e) = crate::recomp::fixup_slot_trampoline(trampoline as *mut u8, orig_addr as usize) {
-        output_verbose(&format!("[stealth2] fixup_trampoline {:#x}: {}", orig_addr, e));
+        output_verbose(&format!("[jpatch2] fixup_trampoline {:#x}: {}", orig_addr, e));
         let _ = crate::recomp::try_revert_slot_patch(orig_addr as usize);
         return false;
     }
     let ret = hook_ffi::hook_mark_recomp_hook_by_trampoline(trampoline);
     if ret != 0 {
-        output_verbose(&format!("[stealth2] mark_recomp_hook {:#x}: {}", orig_addr, ret));
+        output_verbose(&format!("[jpatch2] mark_recomp_hook {:#x}: {}", orig_addr, ret));
         let _ = crate::recomp::try_revert_slot_patch(orig_addr as usize);
         return false;
     }
     // 2. thunk + trampoline 都就绪，原子写 B 指令激活 hook
     if let Err(e) = crate::recomp::commit_slot_patch(orig_addr as usize) {
-        output_verbose(&format!("[stealth2] commit_slot_patch {:#x}: {}", orig_addr, e));
+        output_verbose(&format!("[jpatch2] commit_slot_patch {:#x}: {}", orig_addr, e));
         let _ = crate::recomp::try_revert_slot_patch(orig_addr as usize);
         return false;
     }
@@ -366,7 +366,7 @@ pub(super) unsafe fn deoptimize_everything() -> Result<(), String> {
         }
     }
 
-    // 调用 DeoptimizeEverything(instrumentation, "rustfrida")
+    // 调用 DeoptimizeEverything(instrumentation, "jit-deopt")
     let sym = crate::jsapi::module::libart_dlsym("_ZN3art15instrumentation15Instrumentation20DeoptimizeEverythingEPKc");
     if sym.is_null() {
         return Err("Instrumentation::DeoptimizeEverything 符号未找到".into());
@@ -374,7 +374,7 @@ pub(super) unsafe fn deoptimize_everything() -> Result<(), String> {
 
     type DeoptFn = unsafe extern "C" fn(instrumentation: u64, key: *const u8);
     let deopt: DeoptFn = std::mem::transmute(sym);
-    deopt(instrumentation, b"rustfrida\0".as_ptr());
+    deopt(instrumentation, b"jit-deopt\0".as_ptr());
     Ok(())
 }
 

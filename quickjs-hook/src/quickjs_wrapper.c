@@ -1,15 +1,15 @@
 /*
- * quickjs_wrapper.c - C wrappers for QuickJS inline functions
+ * quickjs_wrapper.c：为 Rust FFI 导出可链接的 QuickJS 辅助函数。
  *
- * QuickJS defines many functions as static inline, which bindgen cannot
- * generate bindings for. This file provides C wrapper functions.
+ * 部分 QuickJS 接口是 static inline 或宏，不能直接当作外部函数符号链接。
+ * 本文件为这些操作提供 qjs_* 入口；调用者仍须保证引擎互斥和对象有效。
  */
 
 #include "quickjs.h"
 #include <stdlib.h>
 #include <string.h>
 
-/* JS_FreeValue wrapper */
+/* 释放调用方持有的一份 JS 值引用；不代表底层共享对象一定立即销毁。 */
 void qjs_free_value(JSContext *ctx, JSValue v) {
     JS_FreeValue(ctx, v);
 }
@@ -19,7 +19,7 @@ void qjs_free_value_rt(JSRuntime *rt, JSValue v) {
     JS_FreeValueRT(rt, v);
 }
 
-/* JS_DupValue wrapper */
+/* 取得可独立释放的一份引用；不同于仅复制 JSValue 结构体的字节。 */
 JSValue qjs_dup_value(JSContext *ctx, JSValue v) {
     return JS_DupValue(ctx, v);
 }
@@ -29,7 +29,7 @@ JSValue qjs_dup_value_rt(JSRuntime *rt, JSValue v) {
     return JS_DupValueRT(rt, v);
 }
 
-/* JS_ToCString wrapper */
+/* 返回 QuickJS 分配的 C 字符串；使用后须配对调用 qjs_free_cstring。 */
 const char *qjs_to_cstring(JSContext *ctx, JSValue val) {
     return JS_ToCString(ctx, val);
 }
@@ -49,7 +49,7 @@ int qjs_set_property(JSContext *ctx, JSValue this_obj, JSAtom prop, JSValue val)
     return JS_SetProperty(ctx, this_obj, prop, val);
 }
 
-/* JS_NewCFunction wrapper */
+/* 将宿主函数包装为 JS 可调用对象；这里创建函数对象，不执行函数体。 */
 JSValue qjs_new_cfunction(JSContext *ctx, JSCFunction *func, const char *name, int length) {
     return JS_NewCFunction(ctx, func, name, length);
 }
@@ -255,13 +255,13 @@ JSValue qjs_uninitialized(void) {
     return JS_UNINITIALIZED;
 }
 
-/* Update stack top for cross-thread usage */
+/* 更新当前线程的栈检查基准；不负责加锁，也不是完整的运行时挂起/恢复。 */
 void qjs_update_stack_top(JSContext *ctx) {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JS_UpdateStackTop(rt);
 }
 
-/* Instruction-cache flush helper for code generated outside QuickJS. */
+/* 刷新指定代码范围的指令缓存；不能将此操作视为内核页表/TLB 一致性的证明。 */
 void qjs_clear_cache(void *start, void *end) {
     __builtin___clear_cache((char *) start, (char *) end);
 }

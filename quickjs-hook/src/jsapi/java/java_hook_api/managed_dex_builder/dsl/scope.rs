@@ -20,7 +20,7 @@ impl<'a> DslParser<'a> {
         if scope.contains_key(&source_name) {
             return Err(self.err(&format!("local '{}' is already declared in this scope", source_name)));
         }
-        let internal_name = format!("__rf_l{}_{}", self.next_local_id, source_name);
+        let internal_name = format!("__rt_l{}_{}", self.next_local_id, source_name);
         self.next_local_id += 1;
         scope.insert(source_name, internal_name.clone());
         Ok(internal_name)

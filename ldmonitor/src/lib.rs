@@ -144,7 +144,7 @@ impl DlopenMonitor {
         let stop_flag_clone = stop_flag.clone();
 
         let handle = thread::Builder::new()
-            .name("wwb-ldmon".into())
+            .name("ldmon".into())
             .spawn(move || {
                 let rt = TokioRuntimeBuilder::new_current_thread()
                     .enable_all()
@@ -156,7 +156,7 @@ impl DlopenMonitor {
                     }
                 });
             })
-            .expect("spawn wwb-ldmon thread");
+            .expect("spawn ldmon");
 
         Ok(Self {
             receiver,

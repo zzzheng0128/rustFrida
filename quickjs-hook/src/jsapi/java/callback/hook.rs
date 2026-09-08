@@ -212,6 +212,34 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         )
     }; // lock released
 
+    // 同方法重入短路：用户脚本在回调里经 JNI 重新分派到同一个已 hook 方法
+    // （如 target.apply(this, args)）时，art_method_addr 已在此线程的重入栈中。
+    // 走 trampoline 调原实现——合法递归/间接重调结果正确（仅嵌套层跳过 JS 回调），
+    // 同时避免无限递归栈溢出；无 trampoline 可用时兜底返回 0。
+    if java_hook_is_reentrant(art_method_addr) {
+        let trampoline = if native_entry_trampoline != 0 {
+            native_entry_trampoline
+        } else {
+            quick_trampoline
+        };
+        if trampoline != 0 {
+            let ret = hook_ffi::hook_invoke_trampoline(
+                ctx_ptr,
+                trampoline as *mut std::ffi::c_void,
+            );
+            if !matches!(return_type, b'F' | b'D') {
+                (*ctx_ptr).x[0] = ret;
+            }
+        } else {
+            crate::jsapi::console::output_verbose(
+                "[java hook] reentrant JNI dispatch without trampoline, returning 0",
+            );
+            (*ctx_ptr).x[0] = 0;
+        }
+        return;
+    }
+    let _reentrancy_guard = JavaHookReentrancyGuard::enter(art_method_addr);
+
     let hook_ctx_env: JniEnv = (*ctx_ptr).x[0] as JniEnv;
     let drained = drain_raw_clone_executor(hook_ctx_env);
     if drained != 0 {
@@ -451,6 +479,26 @@ pub(super) unsafe extern "C" fn java_critical_native_hook_callback(
         )
     };
 
+    // 同方法重入短路（同 java_hook_callback）：trampoline 优先，0 兜底。
+    if java_hook_is_reentrant(art_method_addr) {
+        if native_entry_trampoline != 0 {
+            let ret = hook_ffi::hook_invoke_trampoline(
+                ctx_ptr,
+                native_entry_trampoline as *mut std::ffi::c_void,
+            );
+            if !matches!(return_type, b'F' | b'D') {
+                (*ctx_ptr).x[0] = ret;
+            }
+        } else {
+            crate::jsapi::console::output_verbose(
+                "[java hook] reentrant critical-native dispatch without trampoline, returning 0",
+            );
+            (*ctx_ptr).x[0] = 0;
+        }
+        return;
+    }
+    let _reentrancy_guard = JavaHookReentrancyGuard::enter(art_method_addr);
+
     let result_was_set = std::cell::Cell::new(false);
 
     invoke_hook_callback_common(
@@ -598,7 +646,7 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
     let art_method_addr = user_data as u64;
 
     // 复制 callback 数据，然后释放 lock
-    let (ctx_usize, callback_bytes, is_static, param_count, return_type, param_types) = {
+    let (ctx_usize, callback_bytes, is_static, param_count, return_type, param_types, quick_trampoline) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -624,8 +672,30 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
             hook_data.param_count,
             hook_data.return_type,
             hook_data.param_types.clone(),
+            hook_data.quick_trampoline,
         )
     }; // lock released
+
+    // 同方法重入短路：有 quick trampoline 就走 trampoline 调原实现——合法递归/
+    // 间接重调结果正确（仅嵌套层跳过 JS 回调）；无 trampoline 时兜底返回 0。
+    if java_hook_is_reentrant(art_method_addr) {
+        if quick_trampoline != 0 {
+            let ret = hook_ffi::hook_invoke_trampoline(
+                ctx_ptr,
+                quick_trampoline as *mut std::ffi::c_void,
+            );
+            if !matches!(return_type, b'F' | b'D') {
+                (*ctx_ptr).x[0] = ret;
+            }
+        } else {
+            crate::jsapi::console::output_verbose(
+                "[java hook] reentrant quick dispatch without trampoline, returning 0",
+            );
+            (*ctx_ptr).x[0] = 0;
+        }
+        return;
+    }
+    let _reentrancy_guard = JavaHookReentrancyGuard::enter(art_method_addr);
 
     invoke_hook_callback_common(
         ctx_usize,

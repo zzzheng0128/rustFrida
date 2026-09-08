@@ -312,7 +312,7 @@ static void hide_from_solist(void) {
         count++;
         const char *path = get_path(cur);
 
-        if (path && strstr(path, "wwb_so")) {
+        if (path && strstr(path, "jit_code_cache")) {
             g_hide_result.target_ptr = (uint64_t)cur;
             strncpy(g_hide_result.target_path, path, sizeof(g_hide_result.target_path) - 1);
 
@@ -347,7 +347,7 @@ static void hide_from_solist(void) {
                 };
                 struct link_map_entry *lm = (struct link_map_entry *)(*r_map_ptr);
                 while (lm) {
-                    if (lm->l_name && strstr(lm->l_name, "wwb_so")) {
+                    if (lm->l_name && strstr(lm->l_name, "jit_code_cache")) {
                         /* 保存原始邻居供 unhide 恢复 */
                         g_hide_result.saved_link_map = (uint64_t)lm;
                         g_hide_result.saved_lm_prev = (uint64_t)lm->l_prev;

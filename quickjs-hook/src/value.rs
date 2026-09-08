@@ -1,9 +1,10 @@
-//! JSValue wrapper
+//! JSValue 的薄封装：类型判断、数值转换和显式引用管理。
 
 use crate::ffi;
 use std::ffi::{CStr, CString};
 
-/// Wrapper around QuickJS JSValue
+/// 仅包装底层值的表示。Rust 的 Copy/Clone 不会增加 QuickJS 引用计数，
+/// 本类型也没有自动释放的 Drop；调用方须区分借用、复制引用和所有权转移。
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct JSValue(pub ffi::JSValue);

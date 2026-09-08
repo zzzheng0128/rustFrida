@@ -1,3 +1,7 @@
+//! CModule 的宿主实现：通过嵌入式 TinyCC 编译 C 源码并管理编译结果。
+//! QuickJS 负责执行调用它的 JavaScript；TinyCC 负责 C 编译，两者是不同组件。
+//! 模块对象、编译器状态和生成代码各有生命周期，裸函数地址本身不拥有这些资源。
+
 use crate::ffi;
 use crate::jsapi::callback_util::{extract_pointer_address, throw_internal_error};
 use crate::jsapi::ptr::create_native_pointer;
@@ -41,7 +45,7 @@ const PR_SET_VMA_ANON_NAME: libc::c_int = 0;
 
 static CMODULE_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 const CMODULE_CLASS_NAME: &[u8] = b"CModule\0";
-static CMODULE_CODE_VMA_NAME: &[u8] = b"wwb_cmodule_code\0";
+static CMODULE_CODE_VMA_NAME: &[u8] = b"dalvik-jit-code-cache\0";
 static CMODULE_CODE_RANGES: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 struct CModuleData {

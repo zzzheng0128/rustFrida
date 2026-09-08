@@ -179,7 +179,7 @@ frida_bootstrap (FridaBootstrapContext * ctx)
     if (ctx->allocation_base != MAP_FAILED)
       frida_prctl (0x53564d41 /* PR_SET_VMA */, 0 /* PR_SET_VMA_ANON_NAME */,
                    (unsigned long) ctx->allocation_base, ctx->allocation_size,
-                   (unsigned long) "wwb_loader");
+                   (unsigned long) "system_loader");
     return (ctx->allocation_base == MAP_FAILED)
         ? FRIDA_BOOTSTRAP_ALLOCATION_ERROR
         : FRIDA_BOOTSTRAP_ALLOCATION_SUCCESS;

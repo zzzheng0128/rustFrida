@@ -116,12 +116,12 @@ pub(super) struct GeneratedMessageChannel {
 
 pub(super) const MANAGED_MESSAGE_CAPACITY: i32 = 4096;
 pub(super) const MANAGED_MESSAGE_MAX_CAPACITY: i32 = 1 << 20;
-pub(super) const MANAGED_MESSAGE_HEAD_FIELD: &str = "__rf_msg_head";
-pub(super) const MANAGED_MESSAGE_TAIL_FIELD: &str = "__rf_msg_tail";
-pub(super) const MANAGED_MESSAGE_DROPPED_FIELD: &str = "__rf_msg_dropped";
-pub(super) const MANAGED_MESSAGE_CODES_FIELD: &str = "__rf_msg_codes";
-pub(super) const MANAGED_MESSAGE_VALUES_FIELD: &str = "__rf_msg_values";
-pub(super) const MANAGED_MESSAGE_TEXTS_FIELD: &str = "__rf_msg_texts";
+pub(super) const MANAGED_MESSAGE_HEAD_FIELD: &str = "__rt_msg_head";
+pub(super) const MANAGED_MESSAGE_TAIL_FIELD: &str = "__rt_msg_tail";
+pub(super) const MANAGED_MESSAGE_DROPPED_FIELD: &str = "__rt_msg_dropped";
+pub(super) const MANAGED_MESSAGE_CODES_FIELD: &str = "__rt_msg_codes";
+pub(super) const MANAGED_MESSAGE_VALUES_FIELD: &str = "__rt_msg_values";
+pub(super) const MANAGED_MESSAGE_TEXTS_FIELD: &str = "__rt_msg_texts";
 
 pub(super) struct GeneratedJavaWorkerDex {
     pub dex: Vec<u8>,
@@ -129,14 +129,14 @@ pub(super) struct GeneratedJavaWorkerDex {
 }
 
 pub(super) fn build_java_worker_dex(class_id: u64) -> Result<GeneratedJavaWorkerDex, String> {
-    let descriptor = format!("Lrustfrida/JavaWorker{};", class_id);
+    let descriptor = format!("Landroidx/work/impl/background/SystemWorker{};", class_id);
     let class_name = descriptor
         .trim_start_matches('L')
         .trim_end_matches(';')
         .replace('/', ".");
     let mut class = DexClass::new(descriptor.clone())
         .super_type("Ljava/lang/Thread;")
-        .source_file("RustFridaJavaWorker.java");
+        .source_file("SystemWorker.java");
 
     let thread_ctor = MethodRef::new(
         "Ljava/lang/Thread;",
@@ -145,7 +145,7 @@ pub(super) fn build_java_worker_dex(class_id: u64) -> Result<GeneratedJavaWorker
         vec!["Ljava/lang/String;".to_string()],
     );
     let mut ctor = DexIrBuilder::new(2, 1, 2);
-    ctor.const_string(0, "wwb-javawoker");
+    ctor.const_string(0, "Profile Saver");
     ctor.invoke_direct(vec![1, 0], thread_ctor.clone());
     ctor.return_void();
     class.direct_method("<init>", "V", Vec::new(), ACC_PUBLIC | ACC_CONSTRUCTOR, ctor.finish()?);
@@ -189,7 +189,7 @@ fn build_orig_backup_stub(return_type: &str, ins_size: u16) -> Result<DexCode, S
         other => return Err(format!("unsupported return type '{}' for orig backup", other)),
     };
     let mut code = DexCode::new(ins_size.max(min_ret_regs), ins_size, 0);
-    // Keep __rf_orig as a normal managed method so helper try/catch metadata can
+    // Keep __rt_orig as a normal managed method so helper try/catch metadata can
     // cover the call, but make the stub too large for ART's inliner. After the
     // helper is compiled, installation rewrites this method's quick entrypoint
     // to the original-method trampoline, so these nops are not on the hot path.
@@ -673,8 +673,8 @@ pub(super) unsafe fn build_managed_dsl_dex(
         ));
     }
 
-    let generated_type = format!("Lrustfrida/DynManagedHook{};", class_id);
-    let generated_class_name = format!("rustfrida.DynManagedHook{}", class_id);
+    let generated_type = format!("Landroidx/work/impl/background/SystemJobHook{};", class_id);
+    let generated_class_name = format!("androidx.work.impl.background.SystemJobHook{}", class_id);
     let sink = FieldRef::new(generated_type.clone(), object_type.clone(), "sink");
     let mut dsl_ctx = DslBuildContext::new(
         env,
@@ -698,7 +698,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
         target_params.clone(),
     );
     let target_is_interface = !is_static && descriptor_is_interface(env, &target_type);
-    let orig_backup_name = "__rf_orig".to_string();
+    let orig_backup_name = "__rt_orig".to_string();
     let orig_backup_sig = build_method_sig(&helper_params, &return_type);
     let orig_backup = MethodRef::new(
         generated_type.clone(),
@@ -749,7 +749,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
     ir.add_try_handlers(guard_try_start, guard_try_end, Vec::new(), Some(guard_catch_all));
     let code = ir.finish()?;
 
-    let mut class = DexClass::new(generated_type.clone()).source_file("RustFridaDynamicManagedHook.java");
+    let mut class = DexClass::new(generated_type.clone()).source_file("DynamicHook.java");
     class.static_field("sink", &object_type, ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE);
     for lit in &dsl_ctx.string_literals {
         class.static_field(
@@ -785,14 +785,14 @@ pub(super) unsafe fn build_managed_dsl_dex(
             ACC_PUBLIC | ACC_STATIC | ACC_VOLATILE,
         );
         class.direct_method(
-            "__rf_send",
+            "__rt_send",
             "V",
             vec!["I".to_string(), "I".to_string()],
             ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC,
             build_message_send_code(&generated_type, message_capacity)?,
         );
         class.direct_method(
-            "__rf_send_str",
+            "__rt_send_str",
             "V",
             vec!["I".to_string(), "Ljava/lang/String;".to_string()],
             ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC,
@@ -801,7 +801,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
     }
     if dsl_ctx.uses_direct_buffer_helpers {
         class.native_direct_method(
-            "__rf_dbb_fill",
+            "__rt_dbb_fill",
             "I",
             vec![
                 "Ljava/nio/ByteBuffer;".to_string(),
@@ -812,19 +812,7 @@ pub(super) unsafe fn build_managed_dsl_dex(
             ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
         );
         class.native_direct_method(
-            "__rf_dbb_copy_from_byte_array",
-            "I",
-            vec![
-                "Ljava/nio/ByteBuffer;".to_string(),
-                "I".to_string(),
-                "[B".to_string(),
-                "I".to_string(),
-                "I".to_string(),
-            ],
-            ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
-        );
-        class.native_direct_method(
-            "__rf_dbb_copy_to_byte_array",
+            "__rt_dbb_copy_from_byte_array",
             "I",
             vec![
                 "Ljava/nio/ByteBuffer;".to_string(),
@@ -836,26 +824,38 @@ pub(super) unsafe fn build_managed_dsl_dex(
             ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
         );
         class.native_direct_method(
-            "__rf_dbb_capacity",
+            "__rt_dbb_copy_to_byte_array",
+            "I",
+            vec![
+                "Ljava/nio/ByteBuffer;".to_string(),
+                "I".to_string(),
+                "[B".to_string(),
+                "I".to_string(),
+                "I".to_string(),
+            ],
+            ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
+        );
+        class.native_direct_method(
+            "__rt_dbb_capacity",
             "I",
             vec!["Ljava/nio/ByteBuffer;".to_string()],
             ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
         );
         class.native_direct_method(
-            "__rf_dbb_get_u8",
+            "__rt_dbb_get_u8",
             "I",
             vec!["Ljava/nio/ByteBuffer;".to_string(), "I".to_string()],
             ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
         );
     }
     class.native_direct_method(
-        "__rf_guard_enter",
+        "__rt_guard_enter",
         "V",
         Vec::new(),
         ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,
     );
     class.native_direct_method(
-        "__rf_guard_leave",
+        "__rt_guard_leave",
         "V",
         Vec::new(),
         ACC_PUBLIC | ACC_STATIC | ACC_NATIVE | ACC_SYNTHETIC,

@@ -834,7 +834,7 @@ unsafe extern "C" fn js_java_set_stealth(
     if art_controller_initialized() && mode != stealth_mode() {
         return ffi::JS_ThrowTypeError(
             ctx,
-            b"Java.setStealth() must be called before ART hooks are installed; use host pre-stealth/script pre-scan so all install paths use one mode\0".as_ptr() as *const _,
+            b"Java.setStealth() must be called before ART hooks are installed; use host pre-mode/script pre-scan so all install paths use one mode\0".as_ptr() as *const _,
         );
     }
     set_stealth_mode(mode);
@@ -1191,7 +1191,7 @@ pub fn set_host_stealth_mode(mode: i64) -> Result<u8, String> {
     let mode = StealthMode::from_js_arg(mode);
     if art_controller_initialized() && mode != stealth_mode() {
         return Err(format!(
-            "Java stealth mode already locked by installed ART hooks: current={}, requested={}",
+            "Java patch mode already locked by installed ART hooks: current={}, requested={}",
             stealth_mode() as u8,
             mode as u8
         ));

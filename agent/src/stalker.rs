@@ -26,7 +26,7 @@ extern "C" {
 }
 
 pub fn logcat(msg: &str) {
-    let tag = CString::new("rustFrida").unwrap();
+    let tag = CString::new("art").unwrap();
     let fmt = CString::new("%s").unwrap();
     let msg_c = CString::new(msg).unwrap_or_else(|_| CString::new("invalid msg").unwrap());
     unsafe {
@@ -88,7 +88,7 @@ lazy_static! {
     static ref INSTR_SENDER: Sender<RawInstrMessage> = {
         let (sender, receiver) = bounded::<RawInstrMessage>(100000);
 
-        crate::raw_thread::spawn_detached(b"wwb-stalker\0", move || {
+        crate::raw_thread::spawn_detached(b"HeapTaskDaemon\0", move || {
             let log_path = match OUTPUT_PATH.get() {
                 Some(base) => format!("{}/trace.pb", base),
                 None => {
@@ -115,7 +115,7 @@ lazy_static! {
                 }
             }
         })
-        .expect("spawn raw wwb-stalker thread");
+        .expect("spawn raw gc thread");
 
         sender
     };

@@ -134,7 +134,7 @@ fn cleanup_remote_loader_mappings(pid: i32, injection: &InjectionResult) {
 }
 
 fn main() {
-    set_current_thread_name(b"wwb-rfmain\0");
+    set_current_thread_name(b"CrRendererMain\0");
 
     // Fix #8: 先解析参数（--help/--version 在此退出），再打印 banner
     let args = Args::parse();
@@ -386,7 +386,7 @@ fn main() {
             log_warn!("  1. dmesg | grep -i 'deny\\|avc'  （SELinux 拦截？）");
             log_warn!("  2. logcat | grep -E 'FATAL|crash'  （agent 崩溃？）");
             log_warn!("  3. 使用 --verbose 重新运行查看详细注入日志");
-            log_warn!("  4. adb logcat | grep rustFrida  （查看 agent 日志）");
+            log_warn!("  4. adb logcat | grep -i art  （查看 agent 日志）");
             if let Some(pid) = target_pid {
                 if args.spawn.is_some() {
                     let _ = spawn::resume_child(pid as u32);

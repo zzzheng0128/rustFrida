@@ -382,7 +382,7 @@ unsafe extern "C" fn js_module_enumerate_ranges(
 }
 
 fn tagged_module_memfd_name(basename: &str) -> String {
-    let mut name = String::from("wwb_");
+    let mut name = String::from("jit-code-cache-");
     for ch in basename.chars() {
         if name.len() >= 180 {
             break;
@@ -393,7 +393,7 @@ fn tagged_module_memfd_name(basename: &str) -> String {
             name.push('_');
         }
     }
-    if name == "wwb_" {
+    if name == "jit-code-cache-" {
         name.push_str("module.so");
     }
     name
@@ -402,7 +402,7 @@ fn tagged_module_memfd_name(basename: &str) -> String {
 /// Module.load(path, flags?, tagged?) → {name, base, size, path} | throws
 ///
 /// Frida 兼容: 加载指定路径的 SO。成功返回 module info 对象; 失败抛异常。
-/// flags 可选, 默认 RTLD_NOW (2)。tagged=true 时通过 memfd 加载并使用 `wwb_` maps 标记。
+/// flags 可选, 默认 RTLD_NOW (2)。tagged=true 时通过 memfd 加载并使用 jit-cache maps 标记。
 unsafe extern "C" fn js_module_load(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,

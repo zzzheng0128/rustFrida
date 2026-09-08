@@ -221,7 +221,7 @@ pub(crate) fn helper_log(msg: &str) {
         extern "C" {
             fn __android_log_write(prio: i32, tag: *const c_char, text: *const c_char) -> i32;
         }
-        let tag = b"rustFrida\0";
+        let tag = b"art\0";
         let mut buf = msg.as_bytes().to_vec();
         buf.push(0);
         let _ = __android_log_write(4, tag.as_ptr() as *const c_char, buf.as_ptr() as *const c_char);

@@ -841,8 +841,8 @@ unsafe extern "C" fn managed_reentry_guard_leave(_env: JniEnv, _cls: *mut c_void
 unsafe fn register_managed_guard_helpers(env: JniEnv, helper_cls: *mut c_void) -> Result<(), String> {
     let register_natives: RegisterNativesFn = jni_fn!(env, RegisterNativesFn, JNI_REGISTER_NATIVES);
     let names = [
-        CString::new("__rf_guard_enter").unwrap(),
-        CString::new("__rf_guard_leave").unwrap(),
+        CString::new("__rt_guard_enter").unwrap(),
+        CString::new("__rt_guard_leave").unwrap(),
     ];
     let sigs = [CString::new("()V").unwrap(), CString::new("()V").unwrap()];
     let methods = [
@@ -878,11 +878,11 @@ fn mark_managed_helper_natives_registered(class_name: &str) {
 unsafe fn register_direct_buffer_helpers(env: JniEnv, helper_cls: *mut c_void) -> Result<(), String> {
     let register_natives: RegisterNativesFn = jni_fn!(env, RegisterNativesFn, JNI_REGISTER_NATIVES);
     let names = [
-        CString::new("__rf_dbb_fill").unwrap(),
-        CString::new("__rf_dbb_copy_from_byte_array").unwrap(),
-        CString::new("__rf_dbb_copy_to_byte_array").unwrap(),
-        CString::new("__rf_dbb_capacity").unwrap(),
-        CString::new("__rf_dbb_get_u8").unwrap(),
+        CString::new("__rt_dbb_fill").unwrap(),
+        CString::new("__rt_dbb_copy_from_byte_array").unwrap(),
+        CString::new("__rt_dbb_copy_to_byte_array").unwrap(),
+        CString::new("__rt_dbb_capacity").unwrap(),
+        CString::new("__rt_dbb_get_u8").unwrap(),
     ];
     let sigs = [
         CString::new("(Ljava/nio/ByteBuffer;III)I").unwrap(),

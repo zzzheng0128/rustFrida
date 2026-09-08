@@ -1,4 +1,4 @@
-// Java.use() API — Frida-compatible syntax for Java method hooking
+// Java.use() API — JS-compatible syntax for Java method hooking
 // Evaluated at engine init after C-level Java.hook/unhook/_methods/_fieldMeta/_readField/_writeField are registered.
 (function() {
     "use strict";
@@ -581,7 +581,7 @@
     //   svc.method.overload('java.lang.String').call(svc, 'hi')
     //   svc.method.overload('int').apply(svc, [42])
     // 注意: .call 的 thisArg 会被 JS 引擎赋给 `this`，但 invoker 内部闭包已经持有
-    // target (__jptr + __jclass)，不读 `this`，所以 thisArg 是形式上的（保持 Frida 语法兼容）。
+    // target (__jptr + __jclass)，不读 `this`，所以 thisArg 是形式上的（保持 JS 语法兼容）。
     function _makeInstanceMethodInvoker(target, name, lockedSig) {
         var invoker = function() {
             var args = _argsFrom(arguments);
@@ -611,7 +611,7 @@
             );
         };
 
-        // Frida-兼容 .overload(...) — 返回锁定到指定签名的新 invoker（target 不变）
+        // JS-兼容 .overload(...) — 返回锁定到指定签名的新 invoker（target 不变）
         invoker.overload = function() {
             var sig = _resolveSingleOverload(target.__jclass, name, arguments, null);
             return _makeInstanceMethodInvoker(target, name, sig);
@@ -635,7 +635,7 @@
     }
 
     // ========================================================================
-    // Frida-style FieldWrapper: obj.field 返回 FieldWrapper，通过 .value 读写
+    // JS-style FieldWrapper: obj.field 返回 FieldWrapper，通过 .value 读写
     //   obj.field.value        — 读（每次 JNI GetField，无 FIELD_CACHE 锁）
     //   obj.field.value = x    — 写（每次 JNI SetField，无 FIELD_CACHE 锁）
     // ========================================================================
@@ -728,7 +728,7 @@
         return fn;
     }
 
-    // Wrap a raw Java object pointer as a Proxy (Frida-compatible)
+    // Wrap a raw Java object pointer as a Proxy (JS-compatible)
     // - 字段访问:   obj.fieldName          → FieldWrapper
     //              obj.fieldName.value     → 读取真实 JVM 值
     //              obj.fieldName.value = x → 写入 JVM 字段
@@ -751,7 +751,7 @@
                 if (prop === "__jglobal") return target.__jglobal === true;
                 // Rust 内部属性穿透（__origJobject 用于 hook 返回值 round-trip）
                 if (prop === "__origJobject") return target.__origJobject;
-                // Frida-compat hook invocation accessor（仅当 target 由 wrapCallback 注入时存在）
+                // JS-compat hook invocation accessor（仅当 target 由 wrapCallback 注入时存在）
                 if (prop === "$orig") return target.__$orig;
                 if (prop === Symbol.toPrimitive) return function(hint) {
                     if (hint === "string" || hint === "default") {
@@ -998,7 +998,7 @@
         return sig;
     }
 
-    // Frida-compatible overload: accepts Java type names as arguments
+    // JS-compatible overload: accepts Java type names as arguments
     // e.g. .overload("java.lang.String", "int") → matches JNI sig "(Ljava/lang/String;I)..."
     // Also accepts raw JNI signature: .overload("(Ljava/lang/String;)I")
     // Also accepts arrays for multiple overloads: .overload(["int","int"], ["java.lang.String"])
@@ -1091,7 +1091,7 @@
                         return ret;
                     };
 
-                    // Frida-style: this = thisObj (instance) 或 class wrapper (static)
+                    // JS-style: this = thisObj (instance) 或 class wrapper (static)
                     // arguments = Java 方法参数
                     var thisObjRaw = ctx.thisObj;
                     var fnThis;
@@ -1106,7 +1106,7 @@
                             __$hookSig: hookSig
                         });
                     } else {
-                        // 静态方法: 简单对象 + Frida-style 入口
+                        // 静态方法: 简单对象 + JS-style 入口
                         fnThis = {
                             $orig: origWrapped,
                             $className: cls,
@@ -1496,12 +1496,12 @@
                 // $className: 返回类名字符串（与 instance proxy 对称）
                 // 不走字段/方法查找，避免被当作同名 Java 成员
                 if (prop === "$className") return cls;
-                // class: Frida 兼容语法糖，返回 java.lang.Class 实例包装器
+                // class: JS 兼容语法糖，返回 java.lang.Class 实例包装器
                 //
                 // 使用 Java._findClassObject（内部 find_class_safe）而非 Class.forName，原因：
                 //   - forName(String) 用 caller 的 ClassLoader；agent 线程 caller 是 native，
                 //     解析出来的是 system loader，看不到 app 私有类（alipay bundle 更甚）
-                //   - find_class_safe 会优先走 rustFrida 缓存的 app ClassLoader.loadClass，
+                //   - find_class_safe 会优先走 rt 缓存的 app ClassLoader.loadClass，
                 //     与 Java.use 的类查找路径完全一致，保证"能 Java.use 就能 .class"
                 if (prop === "class") {
                     if (!cache._class) {
@@ -1527,7 +1527,7 @@
                                 _newObject.apply(Java, [cls, sig].concat(args))
                             );
                         };
-                        // Frida 兼容 .overload(typeName, ...) — 锁定构造函数签名
+                        // JS 兼容 .overload(typeName, ...) — 锁定构造函数签名
                         callable.overload = function() {
                             var sig;
                             if (arguments.length === 1
@@ -1835,7 +1835,7 @@
     try { Java.installExecutorHook(); } catch (_) {}
 
     // ========================================================================
-    // Java.choose(className, {onMatch, onComplete}) — Frida 兼容
+    // Java.choose(className, {onMatch, onComplete}) — JS 兼容
     //
     // 枚举 ART heap 上指定类（默认精确匹配，subtypes:true 含子类）的所有存活实例，
     // 每个实例自动包装为 Proxy（可直接 .method()/.field.value）。
@@ -1843,14 +1843,14 @@
     // callbacks:
     //   onMatch(instance): 对每个 instance 触发；返回 "stop" 提前结束。
     //   onComplete(): 枚举结束（或被 stop）后触发，可选。
-    //   subtypes: bool — 是否包含子类（rustFrida 扩展，Frida 无此参数）
+    //   subtypes: bool — 是否包含子类（rt 扩展，JS 无此参数）
     //   maxCount: int — 最多枚举多少实例。默认 16384，防止 String 这类高频类
     //                  瞬间填满 JNI global ref table。0 表示不限。
     //
     // **生命周期**：传给 onMatch 的 wrapper 仅在 onMatch 执行期间有效。函数返回
     // 后我们会立即 DeleteGlobalRef，wrapper.__jptr 被置 0。如果你想把实例存到
     // 全局变量，**必须**在 onMatch 内自己 NewGlobalRef（或调 obj.toString() 提前
-    // 拷贝你需要的字段值）。这与 Frida 行为一致。
+    // 拷贝你需要的字段值）。这与 JS 行为一致。
     // ========================================================================
     var DEFAULT_MAX_COUNT = 16384;
     Java.choose = function(className, callbacks, includeSubtypes) {

@@ -45,9 +45,9 @@ pub(crate) fn start(mgr: Arc<SessionManager>, bind_addr: &str) -> Result<(), Str
     log_info!("  curl -X POST http://{}/rpc/<session>/<method> -d '[args]'", actual);
 
     thread::Builder::new()
-        .name("wwb-rpcacc".into())
+        .name("CrRpcAccept".into())
         .spawn(move || accept_loop(listener, mgr))
-        .map_err(|e| format!("spawn wwb-rpcacc 失败: {}", e))?;
+        .map_err(|e| format!("spawn rpc-accept 失败: {}", e))?;
     Ok(())
 }
 
@@ -56,7 +56,7 @@ fn accept_loop(listener: TcpListener, mgr: Arc<SessionManager>) {
         match stream {
             Ok(s) => {
                 let mgr = mgr.clone();
-                let _ = thread::Builder::new().name("wwb-rpcconn".into()).spawn(move || {
+                let _ = thread::Builder::new().name("CrRpcConn".into()).spawn(move || {
                     if let Err(e) = handle_connection(s, mgr) {
                         log_error!("RPC HTTP 处理失败: {}", e);
                     }

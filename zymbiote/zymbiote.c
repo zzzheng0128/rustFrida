@@ -58,24 +58,24 @@ struct _ZymbioteContext
 /* 全局上下文实例（运行时由 Rust 侧通过 /proc/pid/mem 填充） */
 ZymbioteContext zymbiote =
 {
-    .socket_path = "/rustfrida-zymbiote-00000000000000000000000000000000",
+    .socket_path = "/zygote-shm-00000000000000000000000000000000",
 };
 
 /* 前向声明 */
-int rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name);
-int rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, const char *seinfo, const char *name);
+int zym_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name);
+int zym_replacement_setcontext(uid_t uid, bool is_system_server, const char *seinfo, const char *name);
 struct cap_header;
 struct cap_data;
-int rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *datap);
+int zym_replacement_capset(struct cap_header *hdrp, struct cap_data *datap);
 
-static void rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_now);
-static int rustfrida_stop_and_return_from_setargv0(JNIEnv *env, jobject clazz, jstring name);
-static int rustfrida_get_errno(void);
-static int rustfrida_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
-static ssize_t rustfrida_sendmsg(int sockfd, const struct msghdr *msg, int flags);
-static bool rustfrida_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags);
-static ssize_t rustfrida_recv(int sockfd, void *buf, size_t len, int flags);
-static void rustfrida_patch_build_fields(JNIEnv *env);
+static void zym_wait_for_permission_to_resume(const char *package_name, bool *revert_now);
+static int zym_stop_and_return_from_setargv0(JNIEnv *env, jobject clazz, jstring name);
+static int zym_get_errno(void);
+static int zym_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+static ssize_t zym_sendmsg(int sockfd, const struct msghdr *msg, int flags);
+static bool zym_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags);
+static ssize_t zym_recv(int sockfd, void *buf, size_t len, int flags);
+static void zym_patch_build_fields(JNIEnv *env);
 
 /* ========== ARM64 raw syscall ========== */
 /* 不依赖 libc，直接 svc #0 */
@@ -243,7 +243,7 @@ collect_prop_map_line(const char *line, struct prop_remap_entry *entries, int co
 /* noinline: 独立栈帧，避免与调用者栈帧叠加 */
 __attribute__((noinline))
 static void
-rustfrida_remap_prop_areas_by_path(const char *profile_dir)
+zym_remap_prop_areas_by_path(const char *profile_dir)
 {
     /* Phase 1: 收集所有 /dev/__properties__/ 映射 */
     struct prop_remap_entry entries[MAX_PROP_ENTRIES];
@@ -340,7 +340,7 @@ rustfrida_remap_prop_areas_by_path(const char *profile_dir)
 /* mount 已生效，从 /dev/__properties__/ openat → maps 路径正常 */
 __attribute__((noinline))
 static void
-rustfrida_remap_prop_areas_mounted(void)
+zym_remap_prop_areas_mounted(void)
 {
     char active[] = "/dev/__properties__/.profiles/.active";
 
@@ -503,7 +503,7 @@ set_static_string_field_from_prop(JNIEnv *env, jclass cls, const char *field_nam
 }
 
 static void
-rustfrida_patch_build_fields(JNIEnv *env)
+zym_patch_build_fields(JNIEnv *env)
 {
     jclass build;
     jclass system_properties;
@@ -573,7 +573,7 @@ struct cap_data {
 
 __attribute__((visibility("default")))
 int
-rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *datap)
+zym_replacement_capset(struct cap_header *hdrp, struct cap_data *datap)
 {
     /* 在 cap drop 前执行 mount --bind
      * 先 unshare(CLONE_NEWNS) 确保 mount 不传播到 zygote
@@ -612,7 +612,7 @@ rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *
 __attribute__((section(".text.entrypoint")))
 __attribute__((visibility("default")))
 int
-rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, const char *seinfo, const char *name)
+zym_replacement_setcontext(uid_t uid, bool is_system_server, const char *seinfo, const char *name)
 {
     int res;
 
@@ -636,9 +636,9 @@ rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, cons
         bool revert_now;
 
         if (zymbiote.prop_remap)
-            rustfrida_remap_prop_areas_mounted();
+            zym_remap_prop_areas_mounted();
 
-        rustfrida_wait_for_permission_to_resume(zymbiote.package_name, &revert_now);
+        zym_wait_for_permission_to_resume(zymbiote.package_name, &revert_now);
 
         /* 还原状态：释放 package_name、恢复页保护 */
         zymbiote.free(zymbiote.package_name);
@@ -661,7 +661,7 @@ rustfrida_zymbiote_replacement_setcontext(uid_t uid, bool is_system_server, cons
 __attribute__((section(".text.entrypoint")))
 __attribute__((visibility("default")))
 int
-rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name)
+zym_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name)
 {
     const char *name_utf8;
     bool revert_now;
@@ -684,11 +684,11 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
     /* 属性伪装: remap（仅当 Rust 侧设置 prop_remap 标志时） */
     if (zymbiote.prop_remap)
     {
-        rustfrida_remap_prop_areas_mounted();
-        rustfrida_patch_build_fields(env);
+        zym_remap_prop_areas_mounted();
+        zym_patch_build_fields(env);
     }
 
-    rustfrida_wait_for_permission_to_resume(name_utf8, &revert_now);
+    zym_wait_for_permission_to_resume(name_utf8, &revert_now);
 
     if (zymbiote.package_name != NULL)
     {
@@ -705,7 +705,7 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
     if (revert_now)
     {
         __attribute__((musttail))
-        return rustfrida_stop_and_return_from_setargv0(env, clazz, name);
+        return zym_stop_and_return_from_setargv0(env, clazz, name);
     }
 
     return 0;
@@ -713,7 +713,7 @@ rustfrida_zymbiote_replacement_setargv0(JNIEnv *env, jobject clazz, jstring name
 
 /* ========== 等待 rustFrida 允许恢复 ========== */
 static void
-rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_now)
+zym_wait_for_permission_to_resume(const char *package_name, bool *revert_now)
 {
     int fd;
     struct sockaddr_un addr;
@@ -744,7 +744,7 @@ rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_n
 
     addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1u + name_len);
 
-    if (rustfrida_connect(fd, (const struct sockaddr *)&addr, addrlen) == -1)
+    if (zym_connect(fd, (const struct sockaddr *)&addr, addrlen) == -1)
         goto beach;
 
     /* 发送 hello 消息: {pid, ppid, name_len, name} */
@@ -770,7 +770,7 @@ rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_n
         iov[1].iov_base = (void *)package_name;
         iov[1].iov_len = header.package_name_len;
 
-        if (!rustfrida_sendmsg_all(fd, iov, 2, MSG_NOSIGNAL))
+        if (!zym_sendmsg_all(fd, iov, 2, MSG_NOSIGNAL))
             goto beach;
     }
 
@@ -778,7 +778,7 @@ rustfrida_wait_for_permission_to_resume(const char *package_name, bool *revert_n
     {
         uint8_t rx;
 
-        if (rustfrida_recv(fd, &rx, 1, 0) != 1)
+        if (zym_recv(fd, &rx, 1, 0) != 1)
             goto beach;
     }
 
@@ -808,28 +808,28 @@ beach:
 
 __attribute__((naked, noinline))
 static int
-rustfrida_stop_and_return_from_setargv0(JNIEnv *env, jobject clazz, jstring name)
+zym_stop_and_return_from_setargv0(JNIEnv *env, jobject clazz, jstring name)
 {
     RUSTFRIDA_TAILCALL_TO_RAISE_SIGSTOP();
 }
 
 /* ========== errno 辅助 ========== */
 static int
-rustfrida_get_errno(void)
+zym_get_errno(void)
 {
     return *zymbiote.__errno();
 }
 
 /* ========== EINTR 安全的 socket 操作 ========== */
 static int
-rustfrida_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+zym_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 {
     for (;;)
     {
         if (zymbiote.connect(sockfd, addr, addrlen) == 0)
             return 0;
 
-        if (rustfrida_get_errno() == EINTR)
+        if (zym_get_errno() == EINTR)
             continue;
 
         return -1;
@@ -837,7 +837,7 @@ rustfrida_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 }
 
 static ssize_t
-rustfrida_sendmsg(int sockfd, const struct msghdr *msg, int flags)
+zym_sendmsg(int sockfd, const struct msghdr *msg, int flags)
 {
     for (;;)
     {
@@ -845,7 +845,7 @@ rustfrida_sendmsg(int sockfd, const struct msghdr *msg, int flags)
         if (n != -1)
             return n;
 
-        if (rustfrida_get_errno() == EINTR)
+        if (zym_get_errno() == EINTR)
             continue;
 
         return -1;
@@ -853,7 +853,7 @@ rustfrida_sendmsg(int sockfd, const struct msghdr *msg, int flags)
 }
 
 static bool
-rustfrida_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags)
+zym_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags)
 {
     size_t idx = 0;
 
@@ -869,7 +869,7 @@ rustfrida_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags)
         m.msg_controllen = 0;
         m.msg_flags = 0;
 
-        ssize_t n = rustfrida_sendmsg(sockfd, &m, flags);
+        ssize_t n = zym_sendmsg(sockfd, &m, flags);
         if (n == -1)
             return false;
 
@@ -899,7 +899,7 @@ rustfrida_sendmsg_all(int sockfd, struct iovec *iov, size_t iovlen, int flags)
 }
 
 static ssize_t
-rustfrida_recv(int sockfd, void *buf, size_t len, int flags)
+zym_recv(int sockfd, void *buf, size_t len, int flags)
 {
     for (;;)
     {
@@ -907,7 +907,7 @@ rustfrida_recv(int sockfd, void *buf, size_t len, int flags)
         if (n != -1)
             return n;
 
-        if (rustfrida_get_errno() == EINTR)
+        if (zym_get_errno() == EINTR)
             continue;
 
         return -1;

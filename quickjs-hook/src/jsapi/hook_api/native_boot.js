@@ -1,6 +1,6 @@
-// NativeFunction — Frida-compatible native function calling.
+// NativeFunction — JS-compatible native function calling.
 //
-// Usage (identical to Frida):
+// Usage (identical to JS):
 //   var open = new NativeFunction(
 //       Module.findExportByName('libc.so', 'open'),
 //       'int',                            // return type
@@ -41,7 +41,7 @@
 //   - Max 256 stack-spilled args (2KB stack region)
 //   - Struct-by-value not supported
 
-// hook(addr, fn, stealth?) — Frida 风格回调包装
+// hook(addr, fn, mode?) — JS 风格回调包装
 //   fn(arg0, arg1, ..., arg7) { this.x0, this.$orig(), ... }
 //   固定执行原函数的场景用 Interceptor.attach；hook()/$orig() 只用于条件性调用或替换。
 //     arguments[0..7] = x0..x7 (ARM64 ABI 前 8 个整型参数)
@@ -60,12 +60,12 @@
             ]);
         };
     }
-    globalThis.hook = function(addr, fn, stealth) {
+    globalThis.hook = function(addr, fn, mode) {
         if (typeof fn !== 'function') {
-            return (arguments.length >= 3) ? _hook(addr, fn, stealth) : _hook(addr, fn);
+            return (arguments.length >= 3) ? _hook(addr, fn, mode) : _hook(addr, fn);
         }
         var wrapped = _wrapNativeCallback(fn);
-        return (arguments.length >= 3) ? _hook(addr, wrapped, stealth) : _hook(addr, wrapped);
+        return (arguments.length >= 3) ? _hook(addr, wrapped, mode) : _hook(addr, wrapped);
     };
     if (_recompHook) {
         globalThis.recompHook = function(addr, fn) {
@@ -244,13 +244,20 @@
 
     // NativeFunction 构造器 — 返回一个可调用函数，内部缓存 addr/retType/argTypes
     // 预计算：FPR 哪些槽是 float32（bit mask），避免每次调用重算
-    globalThis.NativeFunction = function NativeFunction(addr, retType, argTypes) {
+    //
+    // 第 4 参数 options（frida 兼容）：
+    //   { scheduling: 'cooperative' | 'exclusive' }
+    //   cooperative（默认）：调用期间协作式让出 JS 引擎锁，其它线程的 hook
+    //     回调可以进 JS（被调函数若触发 hook/阻塞不会拖死全局）；
+    //   exclusive：独占引擎锁执行（旧行为），适合极短且确定不阻塞的调用。
+    globalThis.NativeFunction = function NativeFunction(addr, retType, argTypes, options) {
         if (addr === null || addr === undefined) {
             throw new TypeError("NativeFunction: addr must not be null");
         }
         if (!Array.isArray(argTypes)) {
             throw new TypeError("NativeFunction: argTypes must be an array");
         }
+        var exclusive = !!(options && options.scheduling === 'exclusive');
 
         var retInfo = _resolveType(retType);
         var argInfos = argTypes.map(_resolveType);
@@ -330,7 +337,7 @@
                     }
                 }
             }
-            var raw = __nativeCall(addr, retKind, gpr, fpr, precomputedFloat32Mask, stk);
+            var raw = __nativeCall(addr, retKind, gpr, fpr, precomputedFloat32Mask, stk, exclusive ? 1 : 0);
             if (retKind === 0) return undefined;
             if (retKind === 2 || retKind === 3) return raw;
             return _coerceReturnInt(raw, retInfo);

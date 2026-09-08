@@ -1,4 +1,4 @@
-//! JavaScript API implementations
+//! 宿主扩展 API 的统一注册入口。这些能力由 Rust/C 提供，不属于 QuickJS 标准内置对象。
 
 pub(crate) mod callback_util;
 pub mod console;
@@ -25,7 +25,8 @@ pub use rpc::register_rpc;
 
 use crate::context::JSContext;
 
-/// Register all JavaScript APIs
+/// 将各模块的对象和函数安装到同一个 Context。
+/// 注册与使用是两个阶段：例如 lazy Java 注册完成，不表示应用 ClassLoader 已经就绪。
 pub fn register_all_apis(ctx: &JSContext) {
     register_console(ctx);
     register_file_api(ctx);

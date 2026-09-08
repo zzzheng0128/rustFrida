@@ -487,7 +487,7 @@ fn probe_art_method_spec(env: JniEnv, art_method: u64) -> ArtMethodSpec {
         output_verbose("[art spec] raw clone thread: skip Process.getElapsedCpuTime JNI probe");
     }
 
-    output_verbose("[art spec] Frida-style probe 失败，退回 entry_point 探测...");
+    output_verbose("[art spec] probe 失败，退回 entry_point 探测...");
 
     // Strategy 2: Fallback — probe entry_point offset using code pointer heuristic
     let ep_offset = probe_entry_point_offset_legacy(env, art_method);
@@ -608,7 +608,7 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     let size = frida_size.max(access_flags_end);
 
     output_verbose(&format!(
-        "[art spec] Frida-style 探测成功: access_flags={}, data_={}, entry_point={}, size={} (API {})",
+        "[art spec] 探测成功: access_flags={}, data_={}, entry_point={}, size={} (API {})",
         af_offset, d_offset, ep_offset, size, api_level
     ));
 
@@ -1346,7 +1346,7 @@ pub(super) fn init_jni_id_decoder() {
         let current_mode = unsafe { std::ptr::read_volatile(indirection_field_addr) };
         let forced_pointer_mode = if has_decode {
             output_verbose(&format!(
-                "[jniIds] Frida-style 解码器就绪: DecodeMethodId={}, DecodeFieldId={}, indirection={}",
+                "[jniIds] 解码器就绪: DecodeMethodId={}, DecodeFieldId={}, indirection={}",
                 decode_method_fn.is_some(),
                 decode_field_fn.is_some(),
                 current_mode

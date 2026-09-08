@@ -40,7 +40,7 @@ static JAVA_WORKER_NATIVE_RELEASED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_TID: AtomicI32 = AtomicI32::new(0);
 static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
-static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
+static HOOK_EXEC_VMA_NAME: &[u8] = b"dalvik-jit-code-cache\0";
 
 enum JavaWorkerTask {
     Eval {
@@ -499,6 +499,21 @@ pub fn cleanup() -> bool {
     };
 
     stage("cleanup start", &mut t);
+
+    // ============================================================
+    // Phase 0: 关闭顶层脚本/RPC 新入口，等待在途顶层执行归零。
+    //   必须早于一切 JS 资源释放：挂起的调用（可能正让锁阻塞在外部代码里，
+    //   C 栈上仍挂着 QuickJS 调用帧）仍引用 Runtime 与回调资源。
+    //   等不到就整体保留，不进入后续任何破坏性步骤。
+    // ============================================================
+    if !quickjs_hook::begin_engine_shutdown(std::time::Duration::from_secs(3)) {
+        log_msg("[quickjs] engine shutdown gate: top-level executions still in flight; destructive cleanup skipped\n".to_string());
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
+    stage("phase0 engine_shutdown_gate", &mut t);
+
     let had_java_worker = stop_java_worker();
     if !wait_java_worker_stopped(had_java_worker, 800) {
         log_msg("[quickjs] Java worker native loop still running; destructive cleanup skipped\n".to_string());
@@ -619,7 +634,11 @@ pub fn cleanup() -> bool {
     }
     detach_current_jni_thread();
     stage("phase4 detach_jni_thread", &mut t);
-    cleanup_engine();
+    if !cleanup_engine() {
+        log_msg("[quickjs] cleanup_engine retained engine (top-level still in flight); destructive cleanup skipped\n".to_string());
+        detach_current_jni_thread();
+        return false;
+    }
     stage("phase4 cleanup_engine", &mut t);
     cleanup_wxshadow_patches();
     stage("phase4 cleanup_wxshadow_patches", &mut t);
@@ -790,7 +809,11 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     }
     detach_current_jni_thread();
     stage("phase3 detach_jni_thread", &mut t);
-    cleanup_engine();
+    if !cleanup_engine() {
+        log_msg("[quickjs] cleanup_engine retained engine (top-level still in flight); destructive cleanup skipped\n".to_string());
+        detach_current_jni_thread();
+        return false;
+    }
     stage("phase3 cleanup_engine", &mut t);
 
     log_msg(format!(

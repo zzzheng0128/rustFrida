@@ -176,7 +176,7 @@ pub(crate) fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
 }
 
 pub fn spawn_memory_dump_thread(output_path: String) -> Result<libc::pid_t, String> {
-    crate::raw_thread::spawn_detached(b"wwb-memdump\0", move || match dump_memory_snapshot(&output_path) {
+    crate::raw_thread::spawn_detached(b"GCDaemon\0", move || match dump_memory_snapshot(&output_path) {
         Ok(_) => log_msg(format!("内存快照已保存到: {}\n", output_path)),
         Err(e) => log_msg(format!("内存快照保存失败: {}\n", e)),
     })

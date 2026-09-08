@@ -20,22 +20,39 @@ HELPERS_DIR = os.path.join(SCRIPT_DIR, "helpers")
 BUILD_DIR = os.path.join(SCRIPT_DIR, "build")
 
 # Android NDK setup
-NDK_BASE = os.path.expanduser("~/Android/Sdk/ndk")
+NDK_BASES = [
+    os.path.expanduser(p) for p in (
+        "~/Android/Sdk/ndk",
+        "~/Library/Android/sdk/ndk",
+        "/opt/android-sdk/ndk",
+        "/usr/local/lib/android/sdk/ndk",
+    )
+]
 
 def find_ndk():
-    """Find the latest Android NDK."""
-    if not os.path.isdir(NDK_BASE):
-        print(f"错误: NDK 目录不存在: {NDK_BASE}")
+    """Find the latest Android NDK from the configured candidate paths."""
+    ndk_base = next((p for p in NDK_BASES if os.path.isdir(p)), None)
+    if ndk_base is None:
+        print(f"错误: NDK 目录不存在: 尝试过 {NDK_BASES}")
         sys.exit(1)
-    versions = sorted(os.listdir(NDK_BASE), reverse=True)
+    versions = sorted(os.listdir(ndk_base), reverse=True)
     if not versions:
         print("错误: 未找到 NDK 版本")
         sys.exit(1)
-    return os.path.join(NDK_BASE, versions[0])
+    return os.path.join(ndk_base, versions[0])
+
+def _toolchain_bin(ndk_path):
+    """Pick the host-appropriate NDK toolchain bin/ directory (linux vs darwin)."""
+    host = sys.platform  # 'linux' | 'darwin' | 'win32'
+    prebuilt = "darwin-x86_64" if host == "darwin" else f"{host}-x86_64"
+    if host == "win32":
+        prebuilt = "windows-x86_64"
+    return os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", prebuilt, "bin")
+
 
 def find_tool(ndk_path, tool):
     """Find an NDK tool in the toolchain."""
-    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    toolchain = _toolchain_bin(ndk_path)
     # Try llvm- prefixed first
     llvm_tool = os.path.join(toolchain, f"llvm-{tool}")
     if os.path.isfile(llvm_tool):
@@ -46,9 +63,10 @@ def find_tool(ndk_path, tool):
         return aarch64_tool
     return None
 
+
 def find_clang(ndk_path, api=33):
     """Find the NDK clang for aarch64."""
-    toolchain = os.path.join(ndk_path, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin")
+    toolchain = _toolchain_bin(ndk_path)
     clang = os.path.join(toolchain, f"aarch64-linux-android{api}-clang")
     if os.path.isfile(clang):
         return clang

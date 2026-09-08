@@ -183,7 +183,7 @@ unsafe fn extract_signature_arg(
     }
     if ffi::JS_IsArray(ctx, arg.raw()) == 0 {
         let msg = format!(
-            "{} must be a JNI signature string or Frida-style [params, returnType]",
+            "{} must be a JNI signature string or [params, returnType]",
             name
         );
         return Err(throw_internal_error(ctx, msg));

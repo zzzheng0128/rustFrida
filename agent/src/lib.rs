@@ -359,7 +359,7 @@ fn init_eval_and_respond(script: &str, filename: &str) {
 
 #[cfg(feature = "quickjs")]
 #[no_mangle]
-pub extern "C" fn rustfrida_loadjs_current_thread(
+pub extern "C" fn agent_eval_js_current_thread(
     script_ptr: *const u8,
     script_len: usize,
     filename_ptr: *const u8,
@@ -410,8 +410,8 @@ pub extern "C" fn rustfrida_loadjs_current_thread(
 #[cfg(feature = "quickjs")]
 fn set_java_stealth_and_respond(mode: i64) {
     match quickjs_hook::jsapi::java::set_host_stealth_mode(mode).map(|m| m.to_string()) {
-        Ok(mode) => send_eval_ok(&format!("javastealth={}", mode)),
-        Err(e) => send_eval_err(&format!("javastealth failed: {}", e)),
+        Ok(mode) => send_eval_ok(&format!("javamode={}", mode)),
+        Err(e) => send_eval_err(&format!("javamode failed: {}", e)),
     }
 }
 
@@ -421,7 +421,7 @@ where
     F: FnOnce() + Send + 'static,
 {
     JS_TASKS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-    match raw_thread::spawn_detached(b"wwb-js\0", move || {
+    match raw_thread::spawn_detached(b"JDWP\0", move || {
         let _raw_clone_js = quickjs_hook::mark_raw_clone_js_thread();
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
             let msg = payload
@@ -489,7 +489,7 @@ fn process_cmd(command: &str) {
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            raw_thread::spawn_detached(b"wwb-trace\0", move || {
+            raw_thread::spawn_detached(b"FinalizerDaemon\0", move || {
                 match trace::gum_modify_thread(tid) {
                     Ok(pid) => {
                         write_stream(format!("clone success {}", pid).as_bytes());
@@ -502,7 +502,7 @@ fn process_cmd(command: &str) {
                     kill(process::id() as pid_t, SIGSTOP);
                 }
             })
-            .expect("spawn raw wwb-trace thread");
+            .expect("spawn raw trace thread");
         }
         #[cfg(feature = "frida-gum")]
         Some("stalker") => {
@@ -531,7 +531,7 @@ fn process_cmd(command: &str) {
             quickjs_hook::set_verbose(true);
         }
         #[cfg(feature = "quickjs")]
-        Some("javastealth") => {
+        Some("javamode") => {
             let mode = command
                 .split_whitespace()
                 .nth(1)

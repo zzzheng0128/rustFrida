@@ -216,7 +216,7 @@ fn load_qbdi_helper() -> Result<&'static HelperApi, String> {
     }
 
     let helper_blob = qbdi_helper_blob().ok_or_else(|| "qbdi helper blob not configured".to_string())?;
-    let memfd_name = CString::new("wwb_so").unwrap();
+    let memfd_name = CString::new("jit-zygote-cache").unwrap();
     let fd = unsafe { libc::syscall(libc::SYS_memfd_create as libc::c_long, memfd_name.as_ptr(), 0) as c_int };
     if fd < 0 {
         return Err(format!(

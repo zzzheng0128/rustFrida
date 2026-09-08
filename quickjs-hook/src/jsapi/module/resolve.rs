@@ -285,7 +285,7 @@ pub(crate) unsafe fn module_dlopen_load(
 /// Load a shared object from disk through a tagged memfd.
 ///
 /// This keeps the default `Module.load(path)` behavior unchanged, while allowing
-/// callers to opt into a `/memfd:wwb_*` maps marker when requested.
+/// callers to opt into a `/memfd:jit-code-cache-*` maps marker when requested.
 pub(crate) unsafe fn module_dlopen_load_memfd(
     path: &str,
     flags: i32,

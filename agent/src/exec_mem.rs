@@ -7,7 +7,7 @@ use std::ptr;
 use std::ptr::null_mut;
 
 type Result<T> = std::result::Result<T, String>;
-static TRACE_EXEC_VMA_NAME: &[u8] = b"wwb_trace_exec\0";
+static TRACE_EXEC_VMA_NAME: &[u8] = b"dalvik-jit-code-cache\0";
 
 pub struct ExecMem {
     pub(crate) ptr: *mut u8,
