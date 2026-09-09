@@ -1,0 +1,12 @@
+{
+    "rust-analyzer.cargo.target": "aarch64-linux-android",
+    "rust-analyzer.check.workspace": false,
+    "rust-analyzer.cargo.extraEnv": {
+        "CC_aarch64-linux-android": "${userHome}/Library/Android/sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android33-clang",
+        "CXX_aarch64-linux-android": "${userHome}/Library/Android/sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android33-clang++",
+        "AR_aarch64-linux-android": "${userHome}/Library/Android/sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar",
+        "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER": "${userHome}/Library/Android/sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android33-clang",
+        "BINDGEN_EXTRA_CLANG_ARGS": "--sysroot=${userHome}/Library/Android/sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/darwin-x86_64/sysroot",
+        "RUSTFLAGS": "-L ${userHome}/Library/Android/sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/darwin-x86_64/lib64/clang/14.0.7/lib/linux -l clang_rt.builtins-aarch64-android"
+    }
+}

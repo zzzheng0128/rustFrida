@@ -720,7 +720,7 @@ pub(super) unsafe fn heap_scan_enumerate_instances(
     let mut sgcs_storage = [0u64; SGCS_STORAGE_BYTES / 8];
 
     if allow_suspend_all {
-        let cause_cstr = CString::new("rustFrida Java.choose").unwrap();
+        let cause_cstr = CString::new("Java.choose").unwrap();
 
         // 进入 stop-the-world
         (api.ssa_ctor)(std::ptr::null_mut(), cause_cstr.as_ptr() as *const c_char, 0);

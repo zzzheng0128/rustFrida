@@ -104,6 +104,10 @@ unsafe fn install_hook(
         Err(e) => return e,
     };
 
+    // libdl stub → __loader_* 重定向 (同 Interceptor.attach; hook_invoke_trampoline
+    // 同样用 BLR 调原函数, replace 模式调原时也有 caller-addr 失效问题)
+    let addr = hook_ffi::hook_resolve_target(addr as *mut std::ffi::c_void) as u64;
+
     if let Err(err) = ensure_function_arg(ctx, callback_arg, b"hook() second argument must be a function\0") {
         return err;
     }
@@ -512,6 +516,10 @@ pub(crate) unsafe extern "C" fn js_attach_native(
     }
 
     init_registry();
+
+    // 同 js_interceptor_attach: libdl stub 重定向到 __loader_*, 保持 registry 一致
+    let target = hook_ffi::hook_resolve_target(target as *mut std::ffi::c_void) as u64;
+
     if let Some(old_data) = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&target)).flatten() {
         super::remove_single_hook(target, &old_data);
         if super::callback::wait_for_in_flight_native_hook_callbacks(std::time::Duration::from_millis(20)) {
@@ -800,23 +808,55 @@ pub(crate) unsafe extern "C" fn js_native_call(
     let fn_ptr = addr as *const std::ffi::c_void;
     let stk_ptr = stk.as_ptr();
 
+    // 第 7 参数 flags（可选）：bit0 = exclusive（NativeFunction options.scheduling）。
+    // 默认 cooperative：调用外部 native 代码前协作式让出引擎锁——被调函数可能
+    // 阻塞（dlopen/IO）或间接触发其它 hook，持锁等待会把全局 JS 拖死。
+    let exclusive = if argc >= 7 {
+        JSValue(*argv.add(6)).to_i64(ctx).unwrap_or(0) & 1 != 0
+    } else {
+        false
+    };
+    let yielded = if exclusive {
+        false
+    } else {
+        crate::jsapi::callback_util::yield_js_engine_for_external_call()
+    };
+
+    // 让锁区间只允许触碰纯 native 状态：先拿原始返回值，QuickJS 值构造放回重新持锁后。
+    let raw_int: u64;
+    let raw_f64: f64;
+    let raw_f32: f32;
     match kind {
         NativeRetKind::Void => {
             native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            JSValue::undefined().raw()
+            raw_int = 0;
+            raw_f64 = 0.0;
+            raw_f32 = 0.0;
         }
         NativeRetKind::Int => {
-            let r = native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            js_i64_to_js_number_or_bigint(ctx, r as i64)
+            raw_int = native_call_shim(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
+            raw_f64 = 0.0;
+            raw_f32 = 0.0;
         }
         NativeRetKind::Double => {
-            let r = native_call_shim_f64(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            ffi::qjs_new_float64(ctx, r)
+            raw_f64 = native_call_shim_f64(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
+            raw_int = 0;
+            raw_f32 = 0.0;
         }
         NativeRetKind::Float32 => {
-            let r = native_call_shim_f32(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
-            ffi::qjs_new_float64(ctx, r as f64)
+            raw_f32 = native_call_shim_f32(fn_ptr, gpr.as_ptr(), fpr.as_ptr(), stk_ptr, stk_len);
+            raw_int = 0;
+            raw_f64 = 0.0;
         }
+    }
+
+    crate::jsapi::callback_util::reacquire_js_engine_after_external_call(ctx, yielded);
+
+    match kind {
+        NativeRetKind::Void => JSValue::undefined().raw(),
+        NativeRetKind::Int => js_i64_to_js_number_or_bigint(ctx, raw_int as i64),
+        NativeRetKind::Double => ffi::qjs_new_float64(ctx, raw_f64),
+        NativeRetKind::Float32 => ffi::qjs_new_float64(ctx, raw_f32 as f64),
     }
 }
 
@@ -892,6 +932,12 @@ pub(crate) unsafe extern "C" fn js_interceptor_attach(
         Ok(a) => a,
         Err(e) => return e,
     };
+
+    // libdl 公开 stub (dlopen/dlsym/...) 重定向到 __loader_* 变体:
+    // wrap 路径 (BLR 原函数) 会让 stub 的 __builtin_return_address 失效,
+    // 导致链接器无法识别 caller namespace → basename dlopen 找不到 APEX 库
+    // → 调用方 LOG(FATAL)。在 registry 建 key 前重定向, 保证 attach/detach 一致。
+    let addr = hook_ffi::hook_resolve_target(addr as *mut std::ffi::c_void) as u64;
 
     if !callbacks_arg.is_object() {
         return ffi::JS_ThrowTypeError(

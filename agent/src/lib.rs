@@ -18,6 +18,7 @@ mod exec_mem;
 mod gumlibc;
 mod linker;
 mod pthread_shim;
+mod pthread_tls;
 mod raw_thread;
 pub mod recompiler;
 pub mod safepoint;
@@ -126,6 +127,9 @@ pub struct AgentArgs {
 
 #[no_mangle]
 pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
+    let _tls_cleanup = pthread_shim::ThreadExitGuard;
+    #[cfg(feature = "quickjs")]
+    quickjs_hook::set_thread_exit_callback(pthread_shim::cleanup_current_thread);
     install_panic_hook();
     SHOULD_EXIT.store(false, Ordering::Relaxed);
     SHOULD_DETACH.store(false, Ordering::Relaxed);
@@ -716,7 +720,12 @@ fn process_cmd(command: &str) {
         }
         #[cfg(feature = "quickjs")]
         Some("jsclean") => dispatch_js_task(|| {
-            if quickjs_loader::cleanup() {
+            let ok = quickjs_loader::cleanup();
+            // 交互式清理（非最终卸载）：模块保持加载，无论成败都重开入口——
+            // 成功则旧引擎已销毁、下次加载重建新一代；失败则清理已中止、
+            // 旧引擎继续服务。最终卸载路径（cleanup_for_unload*）不重开。
+            quickjs_hook::reopen_engine_entry();
+            if ok {
                 send_eval_ok("cleaned up");
             } else {
                 send_eval_err("[quickjs] cleanup timeout; destructive free/unmap skipped");

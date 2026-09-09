@@ -145,6 +145,207 @@ unsafe fn write_primitive_return_to_context(
 // Hook callback (runs in hooked thread, called by ART JNI trampoline)
 // ============================================================================
 
+// 只在诊断构建中追踪前 16 次带 String 参数的回调。记录转换边界，
+// 不读取/打印参数内容；非诊断构建不增加热路径计数或输出。
+#[cfg(feature = "engine-depth-diagnostics")]
+fn begin_jni_argument_trace(param_types: &[String]) -> Option<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TRACED: AtomicUsize = AtomicUsize::new(0);
+    if !param_types.iter().any(|sig| sig == "Ljava/lang/String;") {
+        return None;
+    }
+    TRACED
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < 16).then_some(n + 1)
+        })
+        .ok()
+}
+
+#[cfg(feature = "engine-depth-diagnostics")]
+fn trace_jni_argument_stage(trace: Option<usize>, method: u64, stage: &str, index: usize, sig: &str) {
+    if let Some(trace) = trace {
+        crate::jsapi::console::output_message(&format!(
+            "[java.args] trace={} method={:#x} thread={} stage={} arg={} sig={}",
+            trace, method, crate::current_thread_id_u64(), stage, index, sig
+        ));
+    }
+}
+
+// ============================================================================
+// NativeEntry 调用方甄别
+// ============================================================================
+//
+// NativeEntry 内联 hook 的是已注册 C++ 实现本体。打进来的调用未必都是 ART 按本方法
+// 签名分派的 JNI 调用：该实现可能被多个 Java 方法共享注册（实测：抖音 J.N 把多个
+// 不同签名的 native 方法注册到同一 C++ 函数，其他方法的 JIT JNI stub 以人家自己的
+// 签名打进来，x4=1 之类的 int 被当成 jstring → GetStringUTFChars(1) 必崩），或被
+// native 代码以内部约定直接调用。甄别分三层：
+//   1. lr 区域过滤：lr 落在普通 .so 文本 = native 直调（外部 ABI）→ 透传。
+//      libart / jit-cache(匿名·memfd) / odex·oat = JNI 分派区域 → 进下一层。
+//   2. entrypoint 邻近检查：本方法的 quick entrypoint 是专用 stub（非 libart）时，
+//      真实调用的 lr 必落在 [E, E+0x400)——其他方法的 stub 在别的地址 → 透传。
+//   3. 引用参数可信校验（E 是 libart generic trampoline 时 lr 无法区分）：每个
+//      引用参数（L/[ 开头）的句柄必须可读且槽位内容非零、8 字节对齐，否则透传。
+struct NativeCallerRanges {
+    accept: Vec<(u64, u64)>,
+    reject: Vec<(u64, u64)>,
+    libart: Vec<(u64, u64)>,
+    readable: Vec<(u64, u64)>,
+}
+
+static NATIVE_CALLER_RANGES: std::sync::Mutex<Option<NativeCallerRanges>> =
+    std::sync::Mutex::new(None);
+
+fn parse_native_caller_ranges() -> NativeCallerRanges {
+    let mut ranges = NativeCallerRanges {
+        accept: Vec::new(),
+        reject: Vec::new(),
+        libart: Vec::new(),
+        readable: Vec::new(),
+    };
+    if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+        for line in maps.lines() {
+            // 格式: start-end perms offset dev inode [path]
+            let mut parts = line.split_whitespace();
+            let (Some(range), Some(perms)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let Some((start_s, end_s)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(start), Ok(end)) = (
+                u64::from_str_radix(start_s, 16),
+                u64::from_str_radix(end_s, 16),
+            ) else {
+                continue;
+            };
+            let path = parts.nth(3).unwrap_or(""); // 跳过 offset dev inode
+            if perms.starts_with('r') {
+                ranges.readable.push((start, end));
+            }
+            if !perms.contains('x') {
+                continue;
+            }
+            // 普通 .so（非 libart）里的 lr = native 直调（外部 ABI）→ 拒绝；
+            // libart / jit-cache(匿名·memfd) / odex·oat / apk 内代码 = JNI 分派 → 接受。
+            let is_libart = path.contains("libart.so");
+            let is_plain_so = (path.ends_with(".so") || path.contains(".so!")) && !is_libart;
+            if is_libart {
+                ranges.libart.push((start, end));
+            }
+            if is_plain_so {
+                ranges.reject.push((start, end));
+            } else {
+                ranges.accept.push((start, end));
+            }
+        }
+    }
+    ranges
+}
+
+fn native_entry_caller_is_jni(lr: u64) -> bool {
+    let mut guard = match NATIVE_CALLER_RANGES.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    for _ in 0..2 {
+        if let Some(ranges) = guard.as_ref() {
+            if ranges.accept.iter().any(|&(s, e)| lr >= s && lr < e) {
+                return true;
+            }
+            if ranges.reject.iter().any(|&(s, e)| lr >= s && lr < e) {
+                return false;
+            }
+            // 未知区域（新 mmap 的 jit 页等）：重新解析一次再判。
+        }
+        *guard = Some(parse_native_caller_ranges());
+    }
+    // 解析后仍未知：按接受处理（宁可拦截也不丢真实 JNI 调用）
+    true
+}
+
+/// 地址是否落在 libart.so 可执行文本（generic JNI trampoline / dlsym lookup stub）。
+fn native_entry_addr_in_libart(addr: u64) -> bool {
+    let guard = match NATIVE_CALLER_RANGES.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    guard
+        .as_ref()
+        .map(|r| r.libart.iter().any(|&(s, e)| addr >= s && addr < e))
+        .unwrap_or(false)
+}
+
+/// 地址是否落在可读映射内（miss 时重解析一次 maps 再判）。
+fn native_entry_is_readable(addr: u64, len: u64) -> bool {
+    let mut guard = match NATIVE_CALLER_RANGES.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    for _ in 0..2 {
+        if let Some(ranges) = guard.as_ref() {
+            if ranges
+                .readable
+                .iter()
+                .any(|&(s, e)| addr >= s && addr + len <= e)
+            {
+                return true;
+            }
+        }
+        *guard = Some(parse_native_caller_ranges());
+    }
+    false
+}
+
+/// 校验一个 JNI 引用句柄（jstring/jobject/...）是否可信：
+/// 句柄非零时必须指向可读内存，且槽位内容（间接引用表项里的对象指针）
+/// 非零且 8 字节对齐。其他方法共享 C++ 实现打进来时，"引用位置"上往往是
+/// int 小值（如 1）或已清空的槽位——校验失败即外来调用，必须透传而不是 marshal。
+fn native_entry_plausible_jni_ref(raw: u64) -> bool {
+    if raw == 0 {
+        return true; // null 引用是合法的
+    }
+    if !native_entry_is_readable(raw, 8) {
+        return false;
+    }
+    let slot = unsafe { std::ptr::read_unaligned(raw as *const u64) };
+    slot != 0 && slot & 7 == 0
+}
+
+/// 外来调用透传：执行原实现并写回返回值，保持外部调用语义完全不变。
+/// 日志限流（前 8 次 + 每 512 次），避免共享实现被高频调用时刷屏。
+unsafe fn native_entry_foreign_bypass(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    art_method_addr: u64,
+    native_entry_trampoline: u64,
+    return_type: u8,
+    reason: &str,
+) {
+    #[cfg(feature = "engine-depth-diagnostics")]
+    {
+        static BYPASS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = BYPASS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 8 || n % 512 == 0 {
+            crate::jsapi::console::output_message(&format!(
+                "[java.args] foreign-call bypass({}) method={:#x} thread={} lr={:#x} n={}\n",
+                reason,
+                art_method_addr,
+                crate::current_thread_id_u64(),
+                (*ctx_ptr).x[30],
+                n
+            ));
+        }
+    }
+    let _ = (art_method_addr, reason);
+    let ret = hook_ffi::hook_invoke_trampoline(
+        ctx_ptr,
+        native_entry_trampoline as *mut std::ffi::c_void,
+    );
+    if !matches!(return_type, b'F' | b'D') {
+        (*ctx_ptr).x[0] = ret;
+    }
+}
+
 /// Callback invoked by the native hook trampoline when a hooked Java method is called.
 /// After "replace with native", ART's JNI trampoline calls our thunk which calls this.
 ///
@@ -212,6 +413,50 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         )
     }; // lock released
 
+    // NativeEntry 模式甄别外来调用：native_entry_trampoline != 0 说明本 hook 是
+    // 内联在共享 C++ 实现上的。两层过滤 + 一层兜底校验（见上方注释块）。
+    let mut native_entry_need_arg_validation = false;
+    if native_entry_trampoline != 0 {
+        let lr = (*ctx_ptr).x[30];
+        // 第 1 层：lr 落在普通 .so = native 直调（外部 ABI）→ 透传。
+        if !native_entry_caller_is_jni(lr) {
+            native_entry_foreign_bypass(
+                ctx_ptr,
+                art_method_addr,
+                native_entry_trampoline,
+                return_type,
+                "non-jni-lr",
+            );
+            return;
+        }
+        // 第 2 层：本方法 quick entrypoint 是专用 stub 时，真实调用的 lr 必落在
+        // [E, E+0x400)。其他共享实现的方法有它们自己的 stub（同在 jit-cache，
+        // 第 1 层拦不住），lr 不同 → 透传。E 在 libart（generic trampoline）时
+        // lr 无法区分调用的是哪个方法 → 降级为逐参数校验。
+        let ep = crate::jsapi::java::jni_core::ART_METHOD_SPEC
+            .get()
+            .map(|spec| unsafe {
+                std::ptr::read_volatile(
+                    (art_method_addr as usize + spec.entry_point_offset) as *const u64,
+                )
+            })
+            .unwrap_or(0);
+        if ep != 0 && !native_entry_addr_in_libart(ep) {
+            if !(lr >= ep && lr < ep + 0x400) {
+                native_entry_foreign_bypass(
+                    ctx_ptr,
+                    art_method_addr,
+                    native_entry_trampoline,
+                    return_type,
+                    "foreign-stub",
+                );
+                return;
+            }
+        } else {
+            native_entry_need_arg_validation = true;
+        }
+    }
+
     // 同方法重入短路：用户脚本在回调里经 JNI 重新分派到同一个已 hook 方法
     // （如 target.apply(this, args)）时，art_method_addr 已在此线程的重入栈中。
     // 走 trampoline 调原实现——合法递归/间接重调结果正确（仅嵌套层跳过 JS 回调），
@@ -219,9 +464,23 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     if java_hook_is_reentrant(art_method_addr) {
         let trampoline = if native_entry_trampoline != 0 {
             native_entry_trampoline
-        } else {
+        } else if quick_trampoline_entry_valid(art_method_addr, quick_trampoline) {
+            // jit-code-cache 回收后安装期 quickCode 悬垂，尾跳会跳进复用槽位
             quick_trampoline
+        } else {
+            0
         };
+        #[cfg(feature = "engine-depth-diagnostics")]
+        {
+            let h = &*ctx_ptr;
+            crate::jsapi::console::output_message(&format!(
+                "[java.args] reentrant method={:#x} thread={} x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x} x6={:#x} x7={:#x} sp={:#x} tramp={:#x}\n",
+                art_method_addr,
+                crate::current_thread_id_u64(),
+                h.x[0], h.x[1], h.x[2], h.x[3], h.x[4], h.x[5], h.x[6], h.x[7], h.sp,
+                trampoline
+            ));
+        }
         if trampoline != 0 {
             let ret = hook_ffi::hook_invoke_trampoline(
                 ctx_ptr,
@@ -240,6 +499,32 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     }
     let _reentrancy_guard = JavaHookReentrancyGuard::enter(art_method_addr);
 
+    #[cfg(feature = "engine-depth-diagnostics")]
+    let argument_trace = begin_jni_argument_trace(&param_types);
+    #[cfg(feature = "engine-depth-diagnostics")]
+    trace_jni_argument_stage(argument_trace, art_method_addr, "callback-enter", 0, "-");
+    // 决定性诊断：dump thunk 入口保存的全部 GP 寄存器，区分"入口寄存器就是错的"
+    // 与"入口正确、后面才坏"两种崩溃模式。
+    #[cfg(feature = "engine-depth-diagnostics")]
+    if argument_trace.is_some() {
+        let h = &*ctx_ptr;
+        // 安全解引用：仅对疑似用户态映射地址取值，否则标记 -1。
+        // 目的：确认句柄槽位内容在入口时是否有效（*x4=0 说明调用方给的就是坏引用）。
+        let deref = |v: u64| -> u64 {
+            if (0x1000_0000..0x8000_0000_0000).contains(&v) {
+                *(v as *const u64)
+            } else {
+                u64::MAX
+            }
+        };
+        let regs = format!(
+            "x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x} x6={:#x} x7={:#x} sp={:#x} tramp={:#x} lr={:#x} *x2={:#x} *x4={:#x}",
+            h.x[0], h.x[1], h.x[2], h.x[3], h.x[4], h.x[5], h.x[6], h.x[7], h.sp,
+            h.trampoline as u64, h.x[30], deref(h.x[2]), deref(h.x[4])
+        );
+        trace_jni_argument_stage(argument_trace, art_method_addr, "regs", 0, &regs);
+    }
+
     let hook_ctx_env: JniEnv = (*ctx_ptr).x[0] as JniEnv;
     let drained = drain_raw_clone_executor(hook_ctx_env);
     if drained != 0 {
@@ -248,6 +533,43 @@ pub(super) unsafe extern "C" fn java_hook_callback(
 
     // Track whether handle_result was called (false if JS exception occurred)
     let result_was_set = std::cell::Cell::new(false);
+
+    // 第 3 层（仅 NativeEntry 且 entrypoint 是 libart generic trampoline 的降级
+    // 路径）：逐引用参数校验句柄可信性。共享实现的其他方法经 generic trampoline
+    // 打进来时 lr 与本方法无法区分，但它们的"引用位置"参数是小整数或空槽，
+    // 在 marshal 之前拦下，避免 GetStringUTFChars(1) 式崩溃。
+    if native_entry_need_arg_validation {
+        let hook_ctx = &*ctx_ptr;
+        let mut gp_index: usize = 0;
+        let mut fp_index: usize = 0;
+        let mut stack_index: usize = 0;
+        let mut foreign = false;
+        for i in 0..param_count {
+            let type_sig = param_types.get(i).map(|s| s.as_str());
+            let (raw, _fp_raw) = extract_jni_arg(
+                hook_ctx,
+                is_floating_point_type(type_sig),
+                &mut gp_index,
+                &mut fp_index,
+                &mut stack_index,
+            );
+            let is_ref = matches!(type_sig, Some(sig) if sig.starts_with('L') || sig.starts_with('['));
+            if is_ref && !native_entry_plausible_jni_ref(raw) {
+                foreign = true;
+                break;
+            }
+        }
+        if foreign {
+            native_entry_foreign_bypass(
+                ctx_ptr,
+                art_method_addr,
+                native_entry_trampoline,
+                return_type,
+                "bad-ref-arg",
+            );
+            return;
+        }
+    }
 
     let had_js_exception = invoke_hook_callback_common_with_env(
         ctx_usize,
@@ -274,6 +596,8 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                 let mut stack_index: usize = 0;
                 for i in 0..param_count {
                     let type_sig = param_types.get(i).map(|s| s.as_str());
+                    #[cfg(feature = "engine-depth-diagnostics")]
+                    trace_jni_argument_stage(argument_trace, art_method_addr, "read", i, type_sig.unwrap_or("?"));
                     let (raw, fp_raw) = extract_jni_arg(
                         hook_ctx,
                         is_floating_point_type(type_sig),
@@ -281,9 +605,25 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                         &mut fp_index,
                         &mut stack_index,
                     );
+                    #[cfg(feature = "engine-depth-diagnostics")]
+                    if argument_trace.is_some() {
+                        let raw_s = format!(
+                            "{} raw={:#x} fp={:#x}",
+                            type_sig.unwrap_or("?"),
+                            raw,
+                            fp_raw
+                        );
+                        trace_jni_argument_stage(argument_trace, art_method_addr, "raw", i, &raw_s);
+                    }
+                    #[cfg(feature = "engine-depth-diagnostics")]
+                    trace_jni_argument_stage(argument_trace, art_method_addr, "convert", i, type_sig.unwrap_or("?"));
                     let val = marshal_jni_arg_to_js(ctx, env, raw, fp_raw, type_sig);
+                    #[cfg(feature = "engine-depth-diagnostics")]
+                    trace_jni_argument_stage(argument_trace, art_method_addr, "converted", i, type_sig.unwrap_or("?"));
                     ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
                 }
+                #[cfg(feature = "engine-depth-diagnostics")]
+                trace_jni_argument_stage(argument_trace, art_method_addr, "args-ready", param_count, "-");
                 set_js_value_property_atom(ctx, js_ctx, atoms.args, arr);
             }
 
@@ -679,7 +1019,7 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
     // 同方法重入短路：有 quick trampoline 就走 trampoline 调原实现——合法递归/
     // 间接重调结果正确（仅嵌套层跳过 JS 回调）；无 trampoline 时兜底返回 0。
     if java_hook_is_reentrant(art_method_addr) {
-        if quick_trampoline != 0 {
+        if quick_trampoline_entry_valid(art_method_addr, quick_trampoline) {
             let ret = hook_ffi::hook_invoke_trampoline(
                 ctx_ptr,
                 quick_trampoline as *mut std::ffi::c_void,

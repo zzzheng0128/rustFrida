@@ -44,6 +44,20 @@ fn is_registered_native_entry_candidate(addr: u64, bridge: &ArtBridgeFunctions) 
     if entry.path.map(|path| path.contains("/libart.so")).unwrap_or(false) {
         return false;
     }
+    // 映射必须是文件支撑的应用 .so：真正的 RegisterNatives 实现必然在应用
+    // 共享库里。匿名/memfd 可执行页（dalvik-jit-code-cache）是 ART 生成的
+    // quick-ABI 代码（JIT JNI stub / lazy-resolution stub）——内联 hook 它们会
+    // 同时拦截共享同一生成代码的其他方法（按错误签名 marshal 必崩），且透传
+    // 路径会违反 quick ABI 的 xSELF(x19) 约定（实测抖音 J.N.* 连环崩溃：
+    // GetStringUTFChars(1) 与 art_jni_dlsym_lookup_stub+52）。这类目标必须
+    // 走 Clone+Replace（ArtMethod 层路由，等价 Frida 模型）。
+    let is_file_backed_so = entry
+        .path
+        .map(|path| path.ends_with(".so") || path.contains(".so!"))
+        .unwrap_or(false);
+    if !is_file_backed_so {
+        return false;
+    }
     (entry.prot_flags() & libc::PROT_EXEC) != 0
 }
 

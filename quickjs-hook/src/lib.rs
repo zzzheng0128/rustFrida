@@ -1,4 +1,8 @@
-//! quickjs-hook - QuickJS JavaScript engine with inline hook support for ARM64 Android
+//! quickjs-hook：连接 QuickJS 引擎、宿主脚本入口和扩展 API 的 Rust 封装层。
+//!
+//! 阅读主线：JSEngine::new 创建 Runtime/Context 并注册 API；
+//! load_script_with_filename 负责共享引擎的加锁、脚本执行和后续任务处理。
+//! 解释器本体在 quickjs-src；本文件负责宿主生命周期，不负责 JS 字节码解释。
 //!
 //! This crate provides:
 //! - QuickJS JavaScript engine bindings
@@ -27,6 +31,7 @@
 
 mod completion;
 pub mod context;
+mod execution_state;
 pub mod fast_hook;
 pub mod ffi;
 pub mod jsapi;
@@ -59,8 +64,11 @@ pub use jsapi::java::start_java_worker_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
 pub use runtime::JSRuntime;
+pub use raw_thread::set_thread_exit_callback;
 pub use value::JSValue;
 
+pub(crate) use execution_state::js_execution_deadline_expired;
+use execution_state::{EngineLifecycle, JsExecutionDeadlineGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -68,7 +76,6 @@ const JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS: u64 = 6_500;
 
 static QBDI_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
 static QBDI_HELPER_BLOB: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-static JS_EXECUTION_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_qbdi_output_dir(output_dir: impl Into<String>) {
     let _ = QBDI_OUTPUT_DIR.set(output_dir.into());
@@ -86,12 +93,24 @@ pub(crate) fn qbdi_helper_blob() -> Option<Vec<u8>> {
     QBDI_HELPER_BLOB.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// Global JS engine instance (protected by Mutex).
-/// pub(crate) so hook_callback_wrapper can serialize concurrent JS_Call invocations.
+/// 宿主入口共享的引擎；Mutex 用于串行化访问，不能据此推断外部调用不会死锁。
+/// 回调模块也访问此锁。让锁期间的活动调用状态和对象生命期由调用路径另行维护。
 pub(crate) static JS_ENGINE: Mutex<Option<JSEngine>> = Mutex::new(None);
-/// Best-effort owner tracking for the thread currently executing inside the global JS engine.
-/// Used by hook callbacks to distinguish same-thread reentrancy from ordinary contention.
+/// 当前执行线程的辅助标记，用于区分同线程重入和其他线程争用。
+/// 此原子值不替代 Mutex，也不拥有 Runtime 或 Context 的生命周期。
 pub(crate) static JS_ENGINE_OWNER_THREAD: AtomicU64 = AtomicU64::new(0);
+
+/// 查闸门与登记在途执行共用同一把锁。锁序为 ENGINE → LIFECYCLE；
+/// 清理时关闭入口并等待归零，释放生命周期锁后才取得 ENGINE 销毁引擎。
+static ENGINE_LIFECYCLE: EngineLifecycle = EngineLifecycle::new();
+/// 引擎代次：cleanup_engine 每销毁一次引擎递增。让锁时记录的挂起状态
+/// 携带当时的代次，恢复时比对——即使 Runtime 地址被释放后复用，
+/// 代次不一致也能识别出来（地址比较无法识别复用）。
+static JS_ENGINE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn js_engine_generation() -> u64 {
+    JS_ENGINE_GENERATION.load(Ordering::Acquire)
+}
 
 static RAW_CLONE_JS_THREAD_0: AtomicU64 = AtomicU64::new(0);
 static RAW_CLONE_JS_THREAD_1: AtomicU64 = AtomicU64::new(0);
@@ -171,6 +190,7 @@ pub(crate) fn clear_js_engine_owner_current_thread() {
     let _ = JS_ENGINE_OWNER_THREAD.compare_exchange(current, 0, Ordering::AcqRel, Ordering::Relaxed);
 }
 
+// 只管理 owner 标记，不持有或释放引擎锁；必须与实际持锁作用域配合使用。
 struct JsEngineOwnerGuard;
 
 impl JsEngineOwnerGuard {
@@ -186,43 +206,18 @@ impl Drop for JsEngineOwnerGuard {
     }
 }
 
-struct JsExecutionDeadlineGuard {
-    previous_deadline_ms: u64,
+/// RAII：宿主执行（顶层脚本 / RPC）结束（含 `?` 提前返回）时从 TLS 取回
+/// 引擎 guard 并解锁，同时退出执行域计数。与
+/// jsapi::callback_util::host_js_engine_guard_in_tls + note_js_engine_entry 配对。
+struct HostedEngineTlsGuard {
+    site: &'static str,
 }
 
-impl JsExecutionDeadlineGuard {
-    fn begin(timeout_ms: u64) -> Self {
-        let previous_deadline_ms = JS_EXECUTION_DEADLINE_MS.load(Ordering::Acquire);
-        let deadline_ms = if timeout_ms == 0 {
-            0
-        } else {
-            monotonic_ms().saturating_add(timeout_ms)
-        };
-        JS_EXECUTION_DEADLINE_MS.store(deadline_ms, Ordering::Release);
-        Self { previous_deadline_ms }
-    }
-}
-
-impl Drop for JsExecutionDeadlineGuard {
+impl Drop for HostedEngineTlsGuard {
     fn drop(&mut self) {
-        JS_EXECUTION_DEADLINE_MS.store(self.previous_deadline_ms, Ordering::Release);
+        jsapi::callback_util::unhost_js_engine_guard_from_tls();
+        jsapi::callback_util::note_js_engine_exit(self.site);
     }
-}
-
-fn monotonic_ms() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    let ret = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    if ret != 0 {
-        return 0;
-    }
-    (ts.tv_sec as u64)
-        .saturating_mul(1_000)
-        .saturating_add((ts.tv_nsec as u64) / 1_000_000)
-}
-
-pub(crate) fn js_execution_deadline_expired() -> bool {
-    let deadline_ms = JS_EXECUTION_DEADLINE_MS.load(Ordering::Acquire);
-    deadline_ms != 0 && monotonic_ms() >= deadline_ms
 }
 
 /// Log callback registered with the C hook engine.
@@ -281,20 +276,20 @@ pub fn cleanup_hook_engine() {
     }
 }
 
-/// High-level JS engine wrapper
-/// Note: Field order matters for drop order - context must be dropped before runtime
+/// 同时拥有 Context 和 Runtime 的高层封装。
+/// Rust 按字段声明顺序销毁字段：Context 必须先于其依赖的 Runtime 释放。
 pub struct JSEngine {
     context: JSContext,
     runtime: JSRuntime,
 }
 
 impl JSEngine {
-    /// Create a new JS engine with all APIs registered
+    /// 创建引擎并安装宿主扩展；只完成注册，不代表 Java 应用环境已经就绪。
     pub fn new() -> Option<Self> {
         let runtime = JSRuntime::new()?;
         let context = runtime.new_context()?;
 
-        // Register all JavaScript APIs
+        // 向全局对象添加宿主 API；JavaScript 标准内置对象由 QuickJS 创建 Context 时提供。
         jsapi::register_all_apis(&context);
 
         // 预缓存 hook callback 热路径用到的 atom（x0..x30 / sp / pc / lr / returnAddress /
@@ -311,7 +306,7 @@ impl JSEngine {
         self.context.eval(script, "<eval>")
     }
 
-    /// Evaluate a script with a specific filename
+    /// 执行传入的源码字符串；filename 是报错定位名，此方法本身不读取磁盘文件。
     pub fn eval_file(&self, script: &str, filename: &str) -> Result<JSValue, String> {
         self.context.eval(script, filename)
     }
@@ -326,14 +321,13 @@ impl JSEngine {
         &self.runtime
     }
 
-    /// Execute pending jobs (for promises)
+    /// 在当前调用线程处理待执行任务并报告错误；这不是后台线程或独立事件循环。
     pub fn run_pending_jobs(&self) {
-        while self.context.execute_pending_job() {}
+        unsafe { context::drain_pending_jobs_reporting(self.context.as_ptr()) };
     }
 
-    /// Run callbacks queued by Java.ready() after the current top-level script
-    /// has finished, so callbacks can reference helpers declared later in the
-    /// same loadjs payload.
+    /// 顶层脚本结束后交付 Java.ready 队列，使回调能够访问同一脚本后面声明的变量。
+    /// raw clone 线程在此跳过交付；具体就绪条件由 Java 层处理。
     pub fn flush_java_ready_callbacks(&self) -> Result<(), String> {
         if is_raw_clone_js_thread() {
             return Ok(());
@@ -364,23 +358,25 @@ impl Drop for JSEngine {
     }
 }
 
-// Safety: JSEngine is protected by Mutex, ensuring single-threaded access
+// 使用约束：共享入口以 Mutex 串行访问引擎；直接使用 JSEngine 的调用者也必须
+// 保证互斥、线程状态与生命周期正确，unsafe impl 不会自动落实这些条件。
 unsafe impl Send for JSEngine {}
 unsafe impl Sync for JSEngine {}
 
-/// Get or initialize the global JS engine
+/// 确保共享引擎存在；已初始化时复用，不会清空全局变量或重新执行用户脚本。
 pub fn get_or_init_engine() -> Result<(), String> {
     let mut engine = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
+    let _in_flight = ENGINE_LIFECYCLE.try_enter()
+        .ok_or_else(|| "JS engine is shutting down; init rejected".to_string())?;
     if engine.is_none() {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
     }
     Ok(())
 }
 
-/// Load and execute a JavaScript script using the global engine.
-/// Returns the string representation of the result, or an empty string for `undefined`.
+/// 在共享引擎中执行源码，返回结果的字符串表示；undefined 返回字符串 "undefined"。
 ///
 /// 等价于 `load_script_with_filename(script, "<eval>")`。
 pub fn load_script(script: &str) -> Result<String, String> {
@@ -389,16 +385,28 @@ pub fn load_script(script: &str) -> Result<String, String> {
 
 /// Load + execute with an explicit filename (用于 QuickJS 报错时显示 `filename:line:col`)。
 pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String, String> {
-    let mut engine = JS_ENGINE
+    // 引擎 guard 托管进 TLS（与回调入口同一路径），使 NativeFunction 等外部调用
+    // 在顶层脚本中同样可以协作式让锁；作用域结束由 HostedEngineTlsGuard 取回并解锁。
+    let mut engine_guard = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    if engine.is_none() {
-        *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
+    // 在同一生命周期临界区查闸门并登记，登记覆盖初始化和全部让锁窗口。
+    let _in_flight = ENGINE_LIFECYCLE.try_enter()
+        .ok_or_else(|| "JS engine is shutting down; script load rejected".to_string())?;
+    if engine_guard.is_none() {
+        *engine_guard = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
     }
-    let engine = engine.as_ref().ok_or("JS engine not initialized")?;
+    // JSEngine 位于 static Mutex<Option<...>> 内，地址稳定；引擎置换
+    // （cleanup_engine）会等待在途顶层执行归零，因此此引用在整个宿主执行期间有效。
+    let engine_ptr = engine_guard.as_ref().unwrap() as *const JSEngine;
+    jsapi::callback_util::host_js_engine_guard_in_tls(engine_guard);
+    let _tls_unhost = HostedEngineTlsGuard { site: "load-script" };
     let _owner_guard = JsEngineOwnerGuard::acquire();
+    let engine = unsafe { &*engine_ptr };
+    unsafe { jsapi::callback_util::note_js_engine_entry(engine.context().as_ptr(), "load-script") };
     let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
     let value = engine.eval_file(script, filename)?;
+    // 先交付就绪回调，再处理其产生的任务；整个过程仍属于本次宿主调用。
     engine.flush_java_ready_callbacks()?;
     engine.run_pending_jobs();
     let result = if value.is_undefined() {
@@ -448,14 +456,24 @@ fn js_string_literal(s: &str) -> String {
 /// * `Ok(json)` - 返回值的 JSON 字符串表示；`undefined` 返回 `"null"`
 /// * `Err(msg)` - 引擎未初始化 / 方法不存在 / JS 异常
 pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
-    let engine = JS_ENGINE
+    let engine_guard = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    let engine = engine.as_ref().ok_or("JS engine not initialized")?;
+    let _in_flight = ENGINE_LIFECYCLE.try_enter()
+        .ok_or_else(|| "JS engine is shutting down; RPC rejected".to_string())?;
+    if engine_guard.is_none() {
+        return Err("JS engine not initialized".to_string());
+    }
+    // 与 load_script_with_filename 相同的 TLS 托管，让锁语义与回调/顶层一致。
+    let engine_ptr = engine_guard.as_ref().unwrap() as *const JSEngine;
+    jsapi::callback_util::host_js_engine_guard_in_tls(engine_guard);
+    let _tls_unhost = HostedEngineTlsGuard { site: "rpc" };
     let _owner_guard = JsEngineOwnerGuard::acquire();
+    let engine = unsafe { &*engine_ptr };
+    unsafe { jsapi::callback_util::note_js_engine_entry(engine.context().as_ptr(), "rpc") };
     let _deadline_guard = JsExecutionDeadlineGuard::begin(JS_TOP_LEVEL_EXECUTION_TIMEOUT_MS);
 
-    // 构造 `__rpc_dispatch("method", "args_json")` 表达式。
+    // 将方法名与参数文本编码成 JS 字符串字面量，避免把传入内容当作源码拼接。
     let script = format!(
         "__rpc_dispatch({}, {})",
         js_string_literal(method),
@@ -471,9 +489,55 @@ pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
     Ok(result)
 }
 
-/// Cleanup the global JS engine
-pub fn cleanup_engine() {
-    if let Ok(mut engine) = JS_ENGINE.lock() {
-        *engine = None;
+/// 清理第一步：关闭顶层脚本 / RPC 新入口，并有界等待在途顶层执行归零。
+/// 返回 true 才可以销毁引擎；false 表示仍有挂起调用（可能正让锁阻塞在
+/// 外部代码里，C 栈上仍挂着 QuickJS 调用帧），必须保留引擎与相关资源。
+/// 编排层应在释放任何 JS 资源（hook 回调、注册表等）之前调用本函数。
+///
+/// 互斥协议：关闸门在生命周期协议锁下进行，与入口侧"查闸门 → 登记在途"
+/// 的临界区互斥——已登记的执行必然被本函数等到，闸门关闭后来晚的执行
+/// 必然看到闸门。等待计数归零期间不持任何锁：让锁挂起的调用需要重新
+/// 拿 JS_ENGINE 锁才能退出、把计数减到零。
+pub fn begin_engine_shutdown(timeout: std::time::Duration) -> bool {
+    ENGINE_LIFECYCLE.begin_shutdown(timeout)
+}
+
+/// 重新开放顶层脚本 / RPC 入口。
+///
+/// 仅允许"模块保持加载"的交互式清理路径使用（jsclean / jsclean_soft：
+/// 清理中止后恢复原状，或软清理成功、新一代引擎已随销毁递增代次）。
+/// 最终卸载路径（cleanup_for_unload*）不得调用——闸门保持关闭，
+/// 防止模块卸载途中仍有新执行进入。
+pub fn reopen_engine_entry() {
+    ENGINE_LIFECYCLE.reopen();
+}
+
+/// 销毁共享 Context/Runtime。
+///
+/// 返回 true 表示引擎已销毁（或本就不存在）；返回 false 表示仍有在途顶层
+/// 执行，引擎被保留——此时拿到锁并不代表可以销毁挂起调用依赖的 Runtime。
+/// 销毁成功后递增引擎代次，使此前让锁记录的所有挂起状态在恢复时被识别
+/// 为失效（配合代次校验，地址复用也逃不过）。
+pub fn cleanup_engine() -> bool {
+    if !begin_engine_shutdown(std::time::Duration::from_secs(3)) {
+        jsapi::console::output_message(
+            "[rustfrida] cleanup_engine: top-level executions still in flight after 3s; \
+             engine kept alive, cleanup FAILED (resources retained)\n",
+        );
+        return false;
     }
+    let mut engine = match JS_ENGINE.lock() {
+        Ok(engine) => engine,
+        Err(_) => {
+            jsapi::console::output_message(
+                "[rustfrida] cleanup_engine: engine lock poisoned; cleanup FAILED\n",
+            );
+            return false;
+        }
+    };
+    if engine.is_some() {
+        *engine = None;
+        JS_ENGINE_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+    true
 }

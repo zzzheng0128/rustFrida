@@ -1503,7 +1503,9 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
     let boot = include_str!("java_boot.js");
     let cscript = std::ffi::CString::new(boot).map_err(|e| format!("Invalid java boot script: {}", e))?;
     let cfilename = std::ffi::CString::new("<java_boot>").unwrap();
-    ffi::qjs_update_stack_top(ctx_ptr);
+    // Java 懒初始化可能发生在已有 JS 调用中（嵌套进入）：接入统一执行域
+    // 管理，沿用外层栈基准，不在这里重置栈顶；独立进入时（depth 0）才建基准。
+    let _exec_scope = crate::jsapi::callback_util::JsEngineExecutionScope::enter(ctx_ptr);
     let val = ffi::JS_Eval(
         ctx_ptr,
         cscript.as_ptr(),

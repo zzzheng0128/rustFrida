@@ -9,6 +9,16 @@
 #include "hook_engine_internal.h"
 #include <stdbool.h>
 
+/* libdl 接口: 由宿主进程内已加载的 libdl.so 提供, mini-linker 按名解析 */
+extern void* dlopen(const char* filename, int flags);
+extern void* dlsym(void* handle, const char* symbol);
+#ifndef RTLD_NOW
+#define RTLD_NOW 2
+#endif
+#ifndef RTLD_NOLOAD
+#define RTLD_NOLOAD 4
+#endif
+
 /* --- Simple replacement hook (hook_install) --- */
 
 void* hook_install(void* target, void* replacement, int stealth) {
@@ -280,12 +290,61 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
 
 /* --- Attach hook with enter/leave callbacks (hook_attach) --- */
 
+/* libdl 公开 stub (dlopen/android_dlopen_ext/dlsym/dlvsym/dladdr) 内部用
+ * __builtin_return_address(0) 识别调用方 → 链接器据此解析 caller namespace。
+ * 本引擎的 wrap 路径 (on_leave != NULL 时 BLR 原函数) 会让 stub 把 thunk 地址
+ * 当成 caller → 链接器找不到 caller soinfo → basename dlopen 退化为默认命名
+ * 空间查找 → APEX 内库 (如 libstatssocket.so) 必然 "not found",
+ * 调用方 (如 libhwui stats_write InitializeOnce) LOG(FATAL) 直接 SIGABRT。
+ * (tombstone_14 实锤: ~DeferredLayerUpdater → stats_write → dlopen 失败 abort)
+ *
+ * __loader_* 变体把 caller_addr 作为显式参数传入, 不依赖 LR, hook 它们覆盖
+ * 面与 hook 公开 stub 等价 (所有经 libdl stub 的调用最终都进 __loader_*),
+ * 同时完全不破坏 caller 识别。
+ *
+ * 注意: __loader_dlopen(filename, flags, caller_addr) 比 dlopen 多一个参数,
+ * JS onEnter 读 args[0] (path) 的行为不变。 */
+void* hook_resolve_target(void* target) {
+    static int inited = 0;
+    static void* pub_addrs[5];
+    static void* loader_addrs[5];
+    if (!inited) {
+        inited = 1;
+        /* libdl.so 在每个进程都已加载; NOLOAD 拿句柄即可, 永不 dlclose */
+        void* h = dlopen("libdl.so", RTLD_NOW | RTLD_NOLOAD);
+        if (h) {
+            static const char* pubs[5] = {
+                "dlopen", "android_dlopen_ext", "dlsym", "dlvsym", "dladdr"
+            };
+            static const char* loaders[5] = {
+                "__loader_dlopen", "__loader_android_dlopen_ext",
+                "__loader_dlsym", "__loader_dlvsym", "__loader_dladdr"
+            };
+            for (int i = 0; i < 5; i++) {
+                pub_addrs[i] = dlsym(h, pubs[i]);
+                loader_addrs[i] = dlsym(h, loaders[i]);
+            }
+        }
+    }
+    for (int i = 0; i < 5; i++) {
+        if (pub_addrs[i] && pub_addrs[i] == target && loader_addrs[i]) {
+            hook_log("hook_attach: redirect libdl stub %p -> __loader variant %p "
+                     "(preserve caller-addr based namespace resolution)",
+                     target, loader_addrs[i]);
+            return loader_addrs[i];
+        }
+    }
+    return target;
+}
+
 int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void* user_data, int stealth) {
     if (!g_engine.initialized) return HOOK_ERROR_NOT_INITIALIZED;
     if (!target) return HOOK_ERROR_INVALID_PARAM;
     if (!on_enter && !on_leave) return HOOK_ERROR_INVALID_PARAM;
 
     hook_lock(&g_engine.lock);
+
+    target = hook_resolve_target(target);
 
     HookEntry* entry = setup_hook_entry(target);
     if (!entry) {
@@ -511,7 +570,7 @@ int hook_remove(void* target) {
                  * 跨页 patch 有两个 shadow entry (first+second segment), 需分别 release. */
                 int rc = wxshadow_release(target);
                 if (rc != 0) {
-                    hook_log("hook_remove: wxshadow_release FAILED for %p (stealth hook stays active)", target);
+                    hook_log("hook_remove: wxshadow_release FAILED for %p (hook stays active)", target);
                     hook_unlock(&g_engine.lock);
                     return HOOK_ERROR_WXSHADOW_FAILED;
                 }
@@ -521,7 +580,7 @@ int hook_remove(void* target) {
                     void* second_addr = (void*)(t + first_len);
                     int rc2 = wxshadow_release(second_addr);
                     if (rc2 != 0) {
-                        hook_log("hook_remove: stealth1 second-segment release failed at %p", second_addr);
+                        hook_log("hook_remove: wxpatch second-segment release failed at %p", second_addr);
                         /* target 首段已释放, 首指令已恢复原字节, CPU 执行回原流程.
                          * 第二段泄漏无害: 原指令已不会执行到 (首段直接 ret 原逻辑). */
                     }

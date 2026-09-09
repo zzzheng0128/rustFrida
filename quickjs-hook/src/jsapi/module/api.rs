@@ -24,7 +24,56 @@ unsafe fn module_info_to_js(ctx: *mut ffi::JSContext, m: &ModuleInfo) -> ffi::JS
     obj_val.set_property(ctx, "size", size_val);
     obj_val.set_property(ctx, "path", path_val);
 
+    // Frida 兼容: 模块实例方法 getExportByName(symbol)
+    add_cfunction_to_object(ctx, obj, "getExportByName", js_module_object_get_export_by_name, 1);
+
     obj
+}
+
+/// module.getExportByName(symbolName) → NativePointer；找不到抛异常（Frida 语义，
+/// 与 Module.findExportByName 返回 null 不同）。按 this.name → this.path 顺序定位模块。
+unsafe extern "C" fn js_module_object_get_export_by_name(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"getExportByName(symbolName) requires 1 argument\0".as_ptr() as *const _,
+        );
+    }
+    let symbol = match JSValue(*argv).to_string(ctx) {
+        Some(s) => s,
+        None => {
+            return ffi::JS_ThrowTypeError(ctx, b"symbolName must be a string\0".as_ptr() as *const _)
+        }
+    };
+
+    let this_val = JSValue(this);
+    let name_val = this_val.get_property(ctx, "name");
+    let path_val = this_val.get_property(ctx, "path");
+    let name = name_val.to_string(ctx).unwrap_or_default();
+    let path = path_val.to_string(ctx).unwrap_or_default();
+    name_val.free(ctx);
+    path_val.free(ctx);
+
+    let mut addr = std::ptr::null_mut();
+    if !name.is_empty() {
+        addr = module_dlsym(&name, &symbol);
+    }
+    if addr.is_null() && !path.is_empty() && path != name {
+        addr = module_dlsym(&path, &symbol);
+    }
+
+    if addr.is_null() {
+        return crate::jsapi::callback_util::throw_internal_error(
+            ctx,
+            format!("unable to find export '{}' in module '{}'", symbol, name),
+        );
+    }
+    create_native_pointer(ctx, addr as u64).raw()
 }
 
 /// Module.findExportByName(moduleName, symbolName) → NativePointer | null
@@ -495,6 +544,7 @@ unsafe extern "C" fn js_module_load(
     obj_val.set_property(ctx, "path", JSValue::string(ctx, &path));
     obj_val.set_property(ctx, "base", create_native_pointer(ctx, handle as u64));
     obj_val.set_property(ctx, "size", JSValue(ffi::qjs_new_int64(ctx, 0)));
+    add_cfunction_to_object(ctx, obj, "getExportByName", js_module_object_get_export_by_name, 1);
     obj
 }
 

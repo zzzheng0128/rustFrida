@@ -1,0 +1,369 @@
+// ============================================================
+// frida_syscall_monitor.js —— 纯 Frida 用户态 SVC 监控（无需 KernelPatch/KPM）
+//
+// 功能对齐 dysvcpit preset io：监控 openat/read/write/connect/sendto/recvfrom
+// 在用户态拦截 libc.so wrapper，不依赖任何内核补丁。
+//
+// 用法：
+//   ./rustfrida --spawn com.ss.android.ugc.aweme -l frida_syscall_monitor.js
+//   或配合 stress test：-l frida_syscall_monitor.js -l douyin_stress_test.js
+//
+// 与 dysvcpit 的区别：
+//   - ✅ 不需要 KernelPatch/APatch/KPM
+//   - ✅ 任何 root/非 root 设备都可以运行（只要 Frida 能注入）
+//   - ❌ 只能拦截经过 libc wrapper 的调用（直接 svc 指令或 vdso 绕过检测不到）
+//   - ❌ 有用户态 hook 的性能开销（比内核态慢）
+// ============================================================
+
+console.log("[SYSCALL-MON] Loading userland syscall monitor (no KernelPatch required)");
+
+var SC_MON = {
+    enabled: true,
+    verbose: true,
+    capturePath: true,
+    maxDumpBytes: 64,
+    filterUid: -1,
+    filterPid: -1,
+    seq: 0,
+    dropped: 0,
+    ring: [],
+    ringCap: 128,
+    hooks: [],
+
+    log: function (tag, msg) {
+        if (this.verbose) console.log("[SC-MON::" + tag + "] " + msg);
+    }
+};
+
+// ---------- helpers ----------
+function tid() {
+    return Process.getCurrentThreadId();
+}
+
+function comm() {
+    try {
+        var fd = new File("/proc/self/comm", "r");
+        var name = fd.readLine().trim();
+        fd.close();
+        return name;
+    } catch (e) {
+        return "?";
+    }
+}
+
+function isNullPtr(ptr) {
+    if (!ptr) return true;
+    if (typeof ptr.toInt32 === 'function') return ptr.toInt32() === 0;
+    return ptr.toString() === '0x0';
+}(ptrAddr, maxLen) {
+    if (!ptrAddr || ptrAddr.isNull()) return null;
+    try {
+        return ptrAddr.readCString() || "";
+    } catch (e) {
+        return "<fault>";
+    }
+}
+
+function hexDump(addr, len) {
+    if (!addr || addr.isNull() || len <= 0) return "";
+    try {
+        var bytes = Memory.readByteArray(addr, Math.min(len, SC_MON.maxDumpBytes));
+        var view = new Uint8Array(bytes);
+        var hex = "";
+        for (var i = 0; i < view.length; i++) {
+            hex += (view[i] < 16 ? "0" : "") + view[i].toString(16);
+        }
+        return hex;
+    } catch (e) {
+        return "<fault>";
+    }
+}
+
+function sockaddrToString(addr, addrlen) {
+    if (!addr || addr.isNull() || !addrlen) return null;
+    try {
+        var family = addr.readU16();
+        if (family === 2) { // AF_INET
+            var port = addr.add(2).readU16().swap16();
+            var ip = addr.add(4).readByteArray(4);
+            var ipView = new Uint8Array(ip);
+            return ipView[0] + "." + ipView[1] + "." + ipView[2] + "." + ipView[3] + ":" + port;
+        } else if (family === 10) { // AF_INET6
+            var port = addr.add(2).readU16().swap16();
+            return "[ipv6]:" + port;
+        } else if (family === 1) { // AF_UNIX
+            var path = addr.add(2).readCString() || "";
+            return "unix:" + path;
+        }
+        return "family=" + family;
+    } catch (e) {
+        return "<parse-fault>";
+    }
+}
+
+// Number.prototype.swap16 polyfill for Frida
+if (!Number.prototype.swap16) {
+    Number.prototype.swap16 = function () {
+        var v = this.valueOf();
+        return ((v & 0xFF) << 8) | ((v >> 8) & 0xFF);
+    };
+}
+
+// ---------- record ----------
+function record(ev) {
+    if (!SC_MON.enabled) return;
+    SC_MON.seq++;
+    ev.seq = SC_MON.seq;
+    ev.tid = tid();
+    ev.tgid = Process.id;
+    ev.comm = comm();
+    ev.ts = Date.now();
+
+    SC_MON.ring.push(ev);
+    if (SC_MON.ring.length > SC_MON.ringCap) {
+        SC_MON.ring.shift();
+        SC_MON.dropped++;
+    }
+
+    // Print in dysvcpit dmesg format
+    var line = "seq=" + ev.seq +
+        " nr=" + (ev.nr || ev.name) +
+        " tid=" + ev.tid +
+        " tgid=" + ev.tgid +
+        " ret=" + ev.ret +
+        " comm=" + ev.comm;
+    if (ev.path) line += " path=" + ev.path;
+    if (ev.addr) line += " addr=" + ev.addr;
+    if (ev.bufHex) line += " buf=" + ev.bufHex;
+    SC_MON.log("EVENT", line);
+}
+
+// ---------- hook factories ----------
+function hookOpenat() {
+    // Try multiple symbol names for bionic compatibility
+    var symbols = ["openat", "openat64", "__openat", "__openat64"];
+    var addr = null;
+    for (var i = 0; i < symbols.length; i++) {
+        addr = Module.findExportByName("libc.so", symbols[i]);
+        if (addr && typeof addr.toInt32 === 'function' && addr.toInt32() !== 0) break;
+    }
+        addr = Module.findExportByName("libc.so", symbols[i]);
+        if (addr && !addr.isNull()) break;
+    }
+    if (!addr || addr.isNull()) {
+        SC_MON.log("HOOK", "openat not found in libc.so");
+        return;
+    }
+
+    SC_MON.log("HOOK", "openat @ " + addr);
+    var listener = Interceptor.attach(addr, {
+        onEnter: function (args) {
+            this.dirfd = args[0].toInt32();
+            this.pathname = readCStringSafe(args[1], 256);
+            this.flags = args[2].toInt32();
+        },
+        onLeave: function (retval) {
+            record({
+                name: "openat",
+                nr: 56,
+                ret: retval.toInt32(),
+                path: SC_MON.capturePath ? this.pathname : null,
+                a0: this.dirfd,
+                a1: this.flags
+            });
+        }
+    });
+    SC_MON.hooks.push({ name: "openat", listener: listener });
+}
+
+function hookReadWrite(name, nr) {
+    var addr = Module.findExportByName("libc.so", name);
+    if (!addr || addr.isNull()) {
+        SC_MON.log("HOOK", name + " not found");
+        return;
+    }
+
+    SC_MON.log("HOOK", name + " @ " + addr);
+    var listener = Interceptor.attach(addr, {
+        onEnter: function (args) {
+            this.fd = args[0].toInt32();
+            this.buf = args[1];
+            this.count = args[2].toInt32();
+        },
+        onLeave: function (retval) {
+            var ret = retval.toInt32();
+            var ev = {
+                name: name,
+                nr: nr,
+                ret: ret,
+                a0: this.fd,
+                a1: this.count
+            };
+            if (ret > 0 && ret <= 4096) {
+                ev.bufHex = hexDump(this.buf, Math.min(ret, 32));
+            }
+            record(ev);
+        }
+    });
+    SC_MON.hooks.push({ name: name, listener: listener });
+}
+
+function hookConnect() {
+    var addr = Module.findExportByName("libc.so", "connect");
+    if (!addr || addr.isNull()) {
+        SC_MON.log("HOOK", "connect not found");
+        return;
+    }
+
+    SC_MON.log("HOOK", "connect @ " + addr);
+    var listener = Interceptor.attach(addr, {
+        onEnter: function (args) {
+            this.fd = args[0].toInt32();
+            this.addr = args[1];
+            this.addrlen = args[2].toInt32();
+            this.addrStr = sockaddrToString(this.addr, this.addrlen);
+        },
+        onLeave: function (retval) {
+            record({
+                name: "connect",
+                nr: 203,
+                ret: retval.toInt32(),
+                a0: this.fd,
+                addr: this.addrStr
+            });
+        }
+    });
+    SC_MON.hooks.push({ name: "connect", listener: listener });
+}
+
+function hookSendtoRecvfrom(name, nr) {
+    var addr = Module.findExportByName("libc.so", name);
+    if (!addr || addr.isNull()) {
+        SC_MON.log("HOOK", name + " not found");
+        return;
+    }
+
+    SC_MON.log("HOOK", name + " @ " + addr);
+    var listener = Interceptor.attach(addr, {
+        onEnter: function (args) {
+            this.fd = args[0].toInt32();
+            this.buf = args[1];
+            this.len = args[2].toInt32();
+            this.flags = args[3].toInt32();
+            this.addr = args[4];
+            this.addrlen = args[5] ? args[5].readU32() : 0;
+            this.addrStr = sockaddrToString(this.addr, this.addrlen);
+        },
+        onLeave: function (retval) {
+            var ret = retval.toInt32();
+            var ev = {
+                name: name,
+                nr: nr,
+                ret: ret,
+                a0: this.fd,
+                a1: this.len,
+                addr: this.addrStr
+            };
+            if (ret > 0 && ret <= 4096) {
+                ev.bufHex = hexDump(this.buf, Math.min(ret, 32));
+            }
+            record(ev);
+        }
+    });
+    SC_MON.hooks.push({ name: name, listener: listener });
+}
+
+function hookMmap() {
+    var addr = Module.findExportByName("libc.so", "mmap");
+    if (!addr || addr.isNull()) return;
+    SC_MON.log("HOOK", "mmap @ " + addr);
+    var listener = Interceptor.attach(addr, {
+        onEnter: function (args) {
+            this.addr_hint = args[0];
+            this.len = args[1].toInt32();
+            this.prot = args[2].toInt32();
+            this.flags = args[3].toInt32();
+            this.fd = args[4].toInt32();
+            this.offset = args[5].toInt32();
+        },
+        onLeave: function (retval) {
+            record({
+                name: "mmap",
+                nr: 222,
+                ret: retval.toInt32(),
+                a0: this.fd,
+                a1: this.len,
+                a2: this.prot,
+                a3: this.flags
+            });
+        }
+    });
+    SC_MON.hooks.push({ name: "mmap", listener: listener });
+}
+
+// ---------- control API ----------
+function installHooks() {
+    SC_MON.log("INIT", "Installing hooks ...");
+    hookOpenat();
+    hookReadWrite("read", 63);
+    hookReadWrite("write", 64);
+    hookConnect();
+    hookSendtoRecvfrom("sendto", 206);
+    hookSendtoRecvfrom("recvfrom", 207);
+    hookMmap();
+    SC_MON.log("INIT", "Installed " + SC_MON.hooks.length + " hooks");
+}
+
+function uninstallHooks() {
+    SC_MON.hooks.forEach(function (h) {
+        if (h.listener) h.listener.detach();
+    });
+    SC_MON.hooks = [];
+    SC_MON.log("INIT", "All hooks detached");
+}
+
+// ---------- init ----------
+installHooks();
+
+// Heartbeat
+    /* REMOVED setInterval block start */
+    /* REMOVED setInterval block end */
+
+// Crash handler (removed for QuickJS compatibility)
+// Process.setExceptionHandler(function (details) {
+//     SC_MON.log("CRASH", details.type + " at " + details.address);
+//     SC_MON.enabled = false;
+//     return false;
+// });
+
+// RPC exports
+
+// RPC exports
+rpc.exports = rpc.exports || {};
+rpc.exports.syscallMon = {
+    status: function () {
+        return {
+            enabled: SC_MON.enabled,
+            hooks: SC_MON.hooks.length,
+            events: SC_MON.seq,
+            dropped: SC_MON.dropped,
+            ringSize: SC_MON.ring.length
+        };
+    },
+    read: function (afterSeq, limit) {
+        var result = [];
+        var start = afterSeq || 0;
+        var count = 0;
+        for (var i = SC_MON.ring.length - 1; i >= 0; i--) {
+            if (SC_MON.ring[i].seq > start) {
+                result.unshift(SC_MON.ring[i]);
+                count++;
+                if (limit && count >= limit) break;
+            }
+        }
+        return { events: result, next: SC_MON.seq };
+    },
+    start: function () { SC_MON.enabled = true; return "ok"; },
+    stop: function () { SC_MON.enabled = false; return "ok"; },
+    clear: function () { SC_MON.ring = []; SC_MON.seq = 0; SC_MON.dropped = 0; return "ok"; }
+};

@@ -5,6 +5,25 @@ use libc::{
 use std::arch::asm;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static THREAD_EXIT_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+/// 宿主提供 TLS 退出清理；回调代码必须存活到所有本模块线程结束。
+pub fn set_thread_exit_callback(callback: unsafe extern "C" fn()) {
+    THREAD_EXIT_CALLBACK.store(callback as usize, Ordering::Release);
+}
+
+struct ThreadExitGuard;
+
+impl Drop for ThreadExitGuard {
+    fn drop(&mut self) {
+        let callback = THREAD_EXIT_CALLBACK.load(Ordering::Acquire);
+        if callback != 0 {
+            unsafe { std::mem::transmute::<usize, unsafe extern "C" fn()>(callback)() };
+        }
+    }
+}
 
 const STACK_SIZE: usize = 2 * 1024 * 1024;
 const CLONE_SETTLS_RAW: u64 = 0x0008_0000;
@@ -405,6 +424,7 @@ unsafe fn find_elf_symbol(data: &[u8], base: usize, wanted: &str) -> Option<usiz
 }
 
 extern "C" fn raw_thread_entry(arg: usize) -> c_int {
+    let _tls_cleanup = ThreadExitGuard;
     let start = unsafe { &mut *(arg as *mut RawThreadStart) };
     raw_set_name(start.name);
 
