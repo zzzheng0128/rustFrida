@@ -63,8 +63,8 @@ pub use jsapi::java::raw_clone_java_executor_hook_active;
 pub use jsapi::java::start_java_worker_thread;
 pub use jsapi::java::{cut_java_hooks, drain_thunk_in_flight, free_java_hooks};
 pub use jsapi::memory::cleanup_wxshadow_patches;
-pub use runtime::JSRuntime;
 pub use raw_thread::set_thread_exit_callback;
+pub use runtime::JSRuntime;
 pub use value::JSValue;
 
 pub(crate) use execution_state::js_execution_deadline_expired;
@@ -368,7 +368,8 @@ pub fn get_or_init_engine() -> Result<(), String> {
     let mut engine = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    let _in_flight = ENGINE_LIFECYCLE.try_enter()
+    let _in_flight = ENGINE_LIFECYCLE
+        .try_enter()
         .ok_or_else(|| "JS engine is shutting down; init rejected".to_string())?;
     if engine.is_none() {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
@@ -391,7 +392,8 @@ pub fn load_script_with_filename(script: &str, filename: &str) -> Result<String,
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
     // 在同一生命周期临界区查闸门并登记，登记覆盖初始化和全部让锁窗口。
-    let _in_flight = ENGINE_LIFECYCLE.try_enter()
+    let _in_flight = ENGINE_LIFECYCLE
+        .try_enter()
         .ok_or_else(|| "JS engine is shutting down; script load rejected".to_string())?;
     if engine_guard.is_none() {
         *engine_guard = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
@@ -459,7 +461,8 @@ pub fn dispatch_rpc(method: &str, args_json: &str) -> Result<String, String> {
     let engine_guard = JS_ENGINE
         .lock()
         .map_err(|e| format!("Failed to lock JS engine: {}", e))?;
-    let _in_flight = ENGINE_LIFECYCLE.try_enter()
+    let _in_flight = ENGINE_LIFECYCLE
+        .try_enter()
         .ok_or_else(|| "JS engine is shutting down; RPC rejected".to_string())?;
     if engine_guard.is_none() {
         return Err("JS engine not initialized".to_string());
@@ -529,9 +532,7 @@ pub fn cleanup_engine() -> bool {
     let mut engine = match JS_ENGINE.lock() {
         Ok(engine) => engine,
         Err(_) => {
-            jsapi::console::output_message(
-                "[rustfrida] cleanup_engine: engine lock poisoned; cleanup FAILED\n",
-            );
+            jsapi::console::output_message("[rustfrida] cleanup_engine: engine lock poisoned; cleanup FAILED\n");
             return false;
         }
     };

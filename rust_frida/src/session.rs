@@ -22,6 +22,13 @@ pub(crate) struct Session {
     pub(crate) loader_ctx_addr: std::sync::atomic::AtomicU64,
     pub(crate) agent_current_thread_eval_impl: std::sync::atomic::AtomicU64,
     pub(crate) java_worker_ready: AtomicBool,
+    /// A Java worker setup is currently being performed by the post-resume
+    /// task or by an on-demand Java command. Other callers wait for it
+    /// instead of issuing a second worker-init command.
+    pub(crate) java_worker_starting: AtomicBool,
+    /// Prevent multiple post-resume host tasks from being queued for one
+    /// session when spawn/server paths observe the same Java script.
+    pub(crate) java_worker_setup_scheduled: AtomicBool,
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,
     pub(crate) shutdown_requested: AtomicBool,
@@ -42,6 +49,8 @@ impl Session {
             loader_ctx_addr: std::sync::atomic::AtomicU64::new(0),
             agent_current_thread_eval_impl: std::sync::atomic::AtomicU64::new(0),
             java_worker_ready: AtomicBool::new(false),
+            java_worker_starting: AtomicBool::new(false),
+            java_worker_setup_scheduled: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),

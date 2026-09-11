@@ -130,16 +130,6 @@ void* hook_install(void* target, void* replacement, int stealth);
 int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void* user_data, int stealth);
 
 /*
- * Resolve a hook target before attach: libdl public stubs (dlopen/dlsym/...)
- * are redirected to their __loader_* counterparts so that caller-address
- * based namespace resolution inside the linker keeps working when the wrap
- * path (BLR original) is used. Returns `target` unchanged when no redirect
- * applies. Idempotent. Attach/detach paths should call this BEFORE keying
- * any registry by address, so registry and engine agree on the real target.
- */
-void* hook_resolve_target(void* target);
-
-/*
  * Remove a hook
  *
  * @param target        Address that was hooked
@@ -167,6 +157,11 @@ int hook_mark_recomp_hook(void* target);
 /* Same as hook_mark_recomp_hook(), but finds the hook by its trampoline.
  * Useful for recomp callers that receive the trampoline after hook_install. */
 int hook_mark_recomp_hook_by_trampoline(void* trampoline);
+
+/* Resolve a hooked target back to the entry address that should be used
+ * when calling it (e.g. the trampoline for inline-hooked functions).
+ * Defined in hook_engine_inline.c. */
+void* hook_resolve_target(void* target);
 
 /*
  * Cleanup and free all hooks

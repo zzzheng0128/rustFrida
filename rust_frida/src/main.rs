@@ -1,19 +1,27 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
+mod agent_events;
+#[path = "../../shared/agent_log.rs"]
+mod agent_log;
+mod anomaly;
 mod args;
 mod communication;
 mod http_rpc;
 mod injection;
+mod log_output;
 mod logger;
+mod output_paths;
 mod proc_mem;
 mod process;
 mod props;
 mod remote_agent;
 mod repl;
+mod scene;
 mod selinux;
 mod server;
 mod session;
 mod spawn;
+mod trace_bridge;
 mod types;
 
 /// 解析 `--rpc-port` 参数为绑定地址：
@@ -28,6 +36,8 @@ pub(crate) fn parse_rpc_bind(arg: &str) -> String {
 }
 
 use crate::logger::{DIM, RESET};
+#[cfg(feature = "kernel-trace")]
+use anyhow::{anyhow, Result as AnyResult};
 use args::Args;
 use clap::Parser;
 #[cfg(feature = "qbdi")]
@@ -38,10 +48,10 @@ use nix::sys::ptrace;
 use nix::unistd::Pid;
 use process::{attach_to_process, call_target_function, find_pid_by_name};
 use repl::{
-    ensure_java_worker_ready_after_resume, load_script_file, load_script_file_pre_resume, print_eval_result,
-    print_help, rewrite_jseval_for_agent, run_js_repl, script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl,
-    try_loadjs_on_main_thread_if_java, try_managedcounter_on_main_thread, CommandCompleter, EVAL_DEFAULT_TIMEOUT_SECS,
-    EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
+    load_script_file, load_script_file_pre_resume, print_eval_result, print_help, rewrite_jseval_for_agent,
+    run_js_repl, schedule_java_worker_ready_after_resume, script_uses_java_api,
+    try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java, try_managedcounter_on_main_thread,
+    CommandCompleter, EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
 };
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
@@ -139,13 +149,78 @@ fn main() {
     // Fix #8: 先解析参数（--help/--version 在此退出），再打印 banner
     let args = Args::parse();
 
+    // mode=trace 不接受 pid/watch_so/name/spawn；
+    // mode=inject 维持原行为；
+    // mode=hybrid 需要 pid/name 之一。
+    #[cfg(feature = "kernel-trace")]
+    {
+        use crate::args::RunMode;
+        match args.mode {
+            RunMode::Trace => {
+                if args.pid.is_some() || args.watch_so.is_some() || args.name.is_some() {
+                    log_error!("--mode=trace 与 --pid/--watch-so/--name 互斥；改用 --trace-pid/--trace-uid 等");
+                    std::process::exit(1);
+                }
+                // --spawn 允许:tracer 先 attach(uid 过滤),再 monkey 拉起 app,
+                // 从进程出生开始全量采集(无需 frida spawn 门控)
+            }
+            RunMode::Hybrid => {
+                if args.pid.is_none() && args.name.is_none() && args.spawn.is_none() {
+                    log_error!("--mode=hybrid 必须同时指定 --pid、--name 或 --spawn（要注入的进程）");
+                    std::process::exit(1);
+                }
+            }
+            RunMode::Inject => {
+                if args.pid.is_none()
+                    && args.watch_so.is_none()
+                    && args.name.is_none()
+                    && args.spawn.is_none()
+                    && args.dump_props.is_none()
+                    && args.set_prop.is_none()
+                    && args.del_prop.is_none()
+                    && args.repack_props.is_none()
+                    && !args.server
+                {
+                    log_error!(
+                        "必须指定 --pid、--name、--watch-so、--spawn、--server 或属性管理操作；或使用 --mode=trace/--mode=hybrid"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    // 当 kernel-trace feature 未启用时，保留原 required 行为：必须有 target
+    #[cfg(not(feature = "kernel-trace"))]
+    {
+        if args.pid.is_none()
+            && args.watch_so.is_none()
+            && args.name.is_none()
+            && args.spawn.is_none()
+            && args.dump_props.is_none()
+            && args.set_prop.is_none()
+            && args.del_prop.is_none()
+            && args.repack_props.is_none()
+            && !args.server
+        {
+            log_error!("必须指定 --pid、--name、--watch-so、--spawn 或 --server");
+            std::process::exit(1);
+        }
+    }
+
     // 初始化 verbose 模式
     logger::VERBOSE.store(args.verbose, Ordering::Relaxed);
+    #[cfg(feature = "kernel-trace")]
+    if let Err(e) = output_paths::validate_distinct_outputs(args.output.as_deref(), args.trace_output.as_deref()) {
+        eprintln!("输出参数无效: {e}");
+        std::process::exit(1);
+    }
     if let Some(ref path) = args.output {
         if let Err(e) = logger::init_output_file(path) {
             eprintln!("初始化日志文件 '{}' 失败: {}", path, e);
             std::process::exit(1);
         }
+        #[cfg(feature = "kernel-trace")]
+        let _ = kernel_trace::set_diagnostic_sink(trace_diagnostic_line);
     }
 
     logger::print_banner();
@@ -213,6 +288,36 @@ fn main() {
         }
     }
 
+    // ── kernel-trace 模式分发（mode=trace / mode=hybrid）──
+    // mode=trace：纯 eBPF 内核取证，不注入 agent，事件 JSONL 输出到 stdout/文件
+    // mode=hybrid：legacy 注入 + 并行跑 eBPF 取证（事件同时输出到 JSONL）
+    #[cfg(feature = "kernel-trace")]
+    {
+        use crate::args::RunMode;
+        match args.mode {
+            RunMode::Trace => {
+                if let Err(e) = run_trace_mode(&args) {
+                    log_error!("[trace] {:#}", e);
+                    std::process::exit(1);
+                }
+                return;
+            }
+            RunMode::Hybrid => {
+                // hybrid: 启动后台 trace thread，事件写入指定文件或终端；
+                // 注入完成后再回来合并 REPL（这里只启动 trace，不阻塞注入流程）
+                log_info!("[hybrid] 启动后台 kernel-trace 线程");
+                if let Err(e) = start_background_tracer(&args) {
+                    log_error!("[hybrid] KernelTracer 启动失败: {:#}", e);
+                    std::process::exit(1);
+                }
+                // 走原 inject 流程
+            }
+            RunMode::Inject => {
+                // 原行为，不动
+            }
+        }
+    }
+
     // ── Server daemon 模式 ──
     if args.server {
         server::run_server(&args);
@@ -257,7 +362,7 @@ fn main() {
     if !string_overrides.is_empty() {
         log_info!("字符串覆盖列表 ({} 个):", string_overrides.len());
         for (name, value) in &string_overrides {
-            println!("     {} = {}", name, value);
+            logger::text_line(&format!("     {} = {}", name, value));
         }
     }
 
@@ -356,6 +461,16 @@ fn main() {
     }
     session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
 
+    // 在 agent 连接前就启动监控，覆盖 spawn 的早期窗口：这时目标仍可能处于
+    // 停止态，若注入失败或恢复后立即崩溃，不能依赖 REPL 循环才发现。
+    let mut anomaly_monitor = target_pid.map(|pid| {
+        anomaly::Monitor::start(
+            pid,
+            session.clone(),
+            args.output.as_deref().or(args.trace_output.as_deref()),
+        )
+    });
+
     // 启动 socketpair handler（在 host_fd 上读写）
     let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
@@ -447,9 +562,7 @@ fn main() {
             if let Err(e) = spawn::resume_child(pid as u32) {
                 log_error!("恢复子进程失败: {}", e);
             }
-            if let Err(e) = ensure_java_worker_ready_after_resume(&session, post_resume_java_worker_needed) {
-                log_warn!("Java worker 启动失败，后续 Java 操作需要重新初始化 worker: {}", e);
-            }
+            schedule_java_worker_ready_after_resume(session.clone(), post_resume_java_worker_needed);
         }
     }
 
@@ -474,7 +587,7 @@ fn main() {
     };
     rl.set_helper(Some(CommandCompleter::new()));
     let _ = rl.load_history(".rustfrida_history");
-    println!("  {DIM}输入 help 查看命令，exit 退出{RESET}");
+    crate::console_log!("  {DIM}输入 help 查看命令，exit 退出{RESET}");
 
     // 发送 shutdown 到 agent，随后等待 agent 完整清理并主动关闭 socket
     let send_shutdown = |s: &Session| {
@@ -646,4 +759,493 @@ fn main() {
     if args.spawn.is_some() {
         spawn::cleanup_zygote_patches();
     }
+
+    if let Some(monitor) = anomaly_monitor.as_mut() {
+        monitor.stop();
+    }
+}
+
+// =====================================================================
+// kernel-trace 模式实现（仅在 feature = "kernel-trace" 时编译）
+// =====================================================================
+
+#[cfg(feature = "kernel-trace")]
+fn build_trace_options(args: &Args) -> AnyResult<kernel_trace::TraceOptions> {
+    use kernel_trace::parse_signal;
+    use kernel_trace::{parse_process_group, parse_syscall_list};
+
+    // --trace-reg-name 隐含启用 --trace-show-regs（单 reg 也需要先读 /proc/pid/syscall 抓 33 GPR）
+    let show_regs = args.trace_show_regs || args.trace_reg_name.is_some();
+
+    // syscall 名白名单（数字、名字、%分组均可）
+    let syscall_names = match &args.trace_syscall {
+        Some(spec) => parse_syscall_list(spec).map_err(|e| anyhow!("[trace] --trace-syscall 解析失败: {e}"))?,
+        None => Vec::new(),
+    };
+    // syscall 名黑名单
+    let no_syscall_names = match &args.trace_no_syscall {
+        Some(spec) => parse_syscall_list(spec).map_err(|e| anyhow!("[trace] --trace-no-syscall 解析失败: {e}"))?,
+        None => Vec::new(),
+    };
+    // 进程分组
+    let process_groups: Vec<&'static str> = match &args.trace_group {
+        Some(spec) => parse_process_group(spec).map_err(|e| anyhow!("[trace] --trace-group 解析失败: {e}"))?,
+        None => Vec::new(),
+    };
+    // 过滤规则
+    let filter_rules = match &args.trace_filter {
+        Some(spec) => {
+            kernel_trace::parse_filter_list(spec).map_err(|e| anyhow!("[trace] --trace-filter 解析失败: {e}"))?
+        }
+        None => Vec::new(),
+    };
+    // --kill 信号解析
+    let kill_signal = match &args.trace_kill {
+        Some(s) => Some(parse_signal(s).map_err(|e| anyhow!("[trace] --trace-kill 解析失败: {e}"))?),
+        None => None,
+    };
+
+    // spawn 模式下没显式给 trace 目标时,自动用包名解析 uid 作为过滤
+    // (spawn 前 pid 不存在;uid 过滤天然覆盖主进程+全部 fork 子进程)
+    let trace_uid = if args.trace_uid == 0 && args.trace_pid == 0 {
+        if let Some(ref pkg) = args.spawn {
+            let uid = std::fs::metadata(format!("/data/data/{}", pkg))
+                .map(|m| {
+                    use std::os::unix::fs::MetadataExt;
+                    m.uid()
+                })
+                .unwrap_or(0);
+            if uid != 0 {
+                log_info!("[trace] spawn 包 {} → uid {} 自动作为过滤", pkg, uid);
+            }
+            uid
+        } else {
+            0
+        }
+    } else {
+        args.trace_uid
+    };
+
+    Ok(kernel_trace::TraceOptions {
+        pid: args.trace_pid,
+        uid: trace_uid,
+        nr: args.trace_nr,
+        tid_blacklist: args.trace_tid_blacklist.clone(),
+        full_tname: args.full_tname,
+        show_regs,
+        unwind_stack: args.trace_unwind_stack,
+        reg_name: args.trace_reg_name.clone(),
+        uprobe_lib: args.trace_uprobe_lib.clone(),
+        uprobe_offset: args.trace_uprobe_offset.unwrap_or(0),
+        enable_syscall: !args.trace_disable_syscall,
+        syscall_names,
+        no_syscall_names,
+        uid_blacklist: args.trace_no_uid.clone(),
+        process_groups,
+        filter_rules,
+        kill_signal,
+        dumphex: args.trace_dumphex,
+        color: args.trace_color,
+        output_path: args.trace_output.as_ref().map(std::path::PathBuf::from),
+        decode_args: args.trace_decode_args,
+        lib_range: args.trace_lib.clone(),
+        lib_only: args.trace_lib_only,
+        stack_trace: !args.trace_no_stack,
+        full_detail: args.trace_full_detail,
+        hw_breakpoints: Vec::new(),
+    })
+}
+
+#[cfg(feature = "kernel-trace")]
+type TraceOutput = kernel_trace::sink::BufferedOutput<Box<dyn std::io::Write + Send>>;
+
+#[cfg(feature = "kernel-trace")]
+fn open_trace_output(path: Option<&str>) -> std::io::Result<TraceOutput> {
+    let writer: Box<dyn std::io::Write + Send> = match path {
+        Some(path) => Box::new(std::fs::OpenOptions::new().create(true).append(true).open(path)?),
+        None => Box::new(std::io::stdout()),
+    };
+    Ok(kernel_trace::sink::BufferedOutput::new(writer))
+}
+
+#[cfg(feature = "kernel-trace")]
+fn write_unified_kernel(record: &str) -> std::io::Result<()> {
+    match logger::write_kernel_record(record) {
+        // The common writer counts rejected records by source. Keep reading
+        // kernel reports so a slow file cannot block the event reader forever.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        result => result,
+    }
+}
+
+#[cfg(feature = "kernel-trace")]
+fn trace_diagnostic_line(line: &str) {
+    if logger::has_output_file() {
+        let _ = write_unified_kernel(line);
+    } else {
+        eprintln!("{line}");
+    }
+}
+
+#[cfg(feature = "kernel-trace")]
+struct TraceLivePrinter {
+    svc: bool,
+    uprobe: bool,
+    hwbp: bool,
+    every: u64,
+    counts: [u64; 3],
+}
+
+#[cfg(feature = "kernel-trace")]
+impl TraceLivePrinter {
+    fn from_env() -> Self {
+        let spec = std::env::var("RF_TRACE_LIVE").unwrap_or_default();
+        let all = matches!(spec.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "all");
+        let enabled = |name: &str| all || spec.split(',').any(|part| part.trim().eq_ignore_ascii_case(name));
+        let every = std::env::var("RF_TRACE_LIVE_EVERY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(500);
+        Self {
+            svc: enabled("svc"),
+            uprobe: enabled("uprobe"),
+            hwbp: enabled("hwbp"),
+            every,
+            counts: [0; 3],
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.svc || self.uprobe || self.hwbp
+    }
+
+    fn print(&mut self, report: &kernel_trace::TraceReport) {
+        let (enabled, slot) = match report.event_kind {
+            "svc.enter" => (self.svc, 0),
+            "uprobe.hit" => (self.uprobe, 1),
+            "hwbp.hit" => (self.hwbp, 2),
+            _ => return,
+        };
+        if !enabled {
+            return;
+        }
+        self.counts[slot] = self.counts[slot].saturating_add(1);
+        let count = self.counts[slot];
+        if count > 3 && count % self.every != 0 {
+            return;
+        }
+        let mut pretty = report.to_pretty();
+        pretty.insert_str(0, "[trace-live] ");
+        logger::stderr_line(&pretty, &pretty);
+    }
+}
+
+#[cfg(feature = "kernel-trace")]
+fn log_trace_output(
+    output: Option<&TraceOutput>,
+    previous: &mut kernel_trace::sink::OutputStats,
+    last: &mut std::time::Instant,
+) {
+    let now = std::time::Instant::now();
+    if now.duration_since(*last) < std::time::Duration::from_secs(5) {
+        return;
+    }
+    if let Some(output) = output {
+        let current = output.stats();
+        trace_diagnostic_line(&format!(
+            "[trace-output] 已接纳={} 实写字节={} 缓冲字节={} | 增量记录={} 增量write={} 输出I/O耗时={:.1}ms",
+            current.records,
+            current.bytes_written,
+            current.pending_bytes,
+            current.records.saturating_sub(previous.records),
+            current.write_calls.saturating_sub(previous.write_calls),
+            current.io_ns.saturating_sub(previous.io_ns) as f64 / 1_000_000.0,
+        ));
+        *previous = current;
+    }
+    if logger::has_output_file() {
+        let current = logger::output_stats();
+        // Keep low-frequency output health visible even when events go to file.
+        let status = format!(
+            "[output] 入队={} 已处理={} 待处理={} 占用={}KiB 缓冲={}B 实写={}B | 丢弃 host={} agent={} kernel={} 错误={}",
+            current.accepted, current.processed, current.pending_records,
+            current.pending_bytes / 1024, current.buffered_bytes, current.bytes_written,
+            current.host_dropped, current.agent_dropped, current.kernel_dropped, current.errors,
+        );
+        logger::stderr_line(&status, &status);
+    }
+    let callbacks = trace_bridge::callback_stats();
+    trace_diagnostic_line(&format!(
+        "[trace-js] svc已发送={} 限流省略={} | uprobe已发送={} 限流省略={} | hwbp已发送={} 限流省略={} | 连接或发送不可用={} 超时熔断={}",
+        callbacks.svc_sent,
+        callbacks.svc_limited,
+        callbacks.uprobe_sent,
+        callbacks.uprobe_limited,
+        callbacks.hwbp_sent,
+        callbacks.hwbp_limited,
+        callbacks.unavailable,
+        callbacks.timed_out,
+    ));
+    *last = now;
+}
+
+/// mode=trace：纯 eBPF 内核取证，不注入 agent。
+/// 事件以 JSONL 输出到 stdout 或 --trace-output 指定的文件。
+#[cfg(feature = "kernel-trace")]
+fn run_trace_mode(args: &Args) -> AnyResult<()> {
+    log_info!("[trace] 启动内核态取证器");
+    let nr_name = if args.trace_nr >= 0 {
+        kernel_trace::nr_to_name(args.trace_nr as i64).unwrap_or("?")
+    } else {
+        "(任意)"
+    };
+    log_info!(
+        "[trace] filter: pid={} uid={} nr={}({}) tid_blacklist={:?}",
+        args.trace_pid,
+        args.trace_uid,
+        args.trace_nr,
+        nr_name,
+        args.trace_tid_blacklist
+    );
+    log_info!(
+        "[trace] features: show_regs={} unwind_stack={} reg_name={:?}",
+        args.trace_show_regs,
+        args.trace_unwind_stack,
+        args.trace_reg_name
+    );
+    if let Some(ref lib) = args.trace_uprobe_lib {
+        log_info!("[trace] uprobe: lib={} offset={:?}", lib, args.trace_uprobe_offset);
+    }
+    if !args.trace_disable_syscall {
+        log_info!("[trace] tracepoint: raw_syscalls/sys_enter (always-on 除非 --trace-disable-syscall)");
+    } else {
+        log_info!("[trace] tracepoint 已禁用（--trace-disable-syscall）");
+    }
+
+    let opts = match build_trace_options(args) {
+        Ok(o) => o,
+        Err(e) => {
+            log_error!("{}", e);
+            std::process::exit(2);
+        }
+    };
+    let file_output = args.trace_output.is_some();
+    let unified_output = logger::has_output_file();
+    let mut output = open_trace_output(args.trace_output.as_deref())?;
+    let tracer = match kernel_trace::KernelTracer::start(opts) {
+        Ok(t) => t,
+        Err(e) => {
+            log_error!("[trace] KernelTracer 启动失败: {:#}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // spawn:tracer 已 attach(uid 过滤从出生覆盖),现在拉起 app
+    if let Some(ref pkg) = args.spawn {
+        log_info!("[trace] spawn 拉起 app: {}", pkg);
+        let out = std::process::Command::new("monkey")
+            .args(["-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => log_error!("[trace] monkey 拉起失败: {}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) => log_error!("[trace] monkey 执行失败: {}", e),
+        }
+    }
+
+    log_info!(
+        "[trace] 就绪：按 Ctrl+C 停止。事件输出到 {}",
+        args.output
+            .as_deref()
+            .or(args.trace_output.as_deref())
+            .unwrap_or("stdout")
+    );
+
+    // 用户态→内核态 动态指令通道：stdin 每行一条命令，
+    // 实时改 FILTER map（pid/uid/nr/any）或动态挂 uprobe 断点（brk lib 0xoff）
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let cmd_tx = tracer.command_tx();
+        std::thread::Builder::new()
+            .name("trace-cmd".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                let help = "[trace-cmd] 动态指令: pid N | uid N | nr N | any | brk <lib> <0xoff> | pause N | cont N";
+                logger::stderr_line(help, help);
+                let stdin = std::io::stdin();
+                for line in stdin.lock().lines() {
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                    match kernel_trace::TraceCommand::parse(&line) {
+                        Some(cmd) => {
+                            let _ = cmd_tx.send(cmd);
+                        }
+                        None => {
+                            let t = line.trim();
+                            if !t.is_empty() {
+                                let message = format!("[trace-cmd] 未识别命令: {t}");
+                                logger::stderr_line(&message, &message);
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
+    let mut formatted = String::with_capacity(2048);
+    let mut previous_output = output.stats();
+    let mut last_output = std::time::Instant::now();
+    let mut live = TraceLivePrinter::from_env();
+    if live.enabled() {
+        log_info!(
+            "[trace-live] enabled={}{}{} every={}",
+            if live.svc { "svc " } else { "" },
+            if live.uprobe { "uprobe " } else { "" },
+            if live.hwbp { "hwbp " } else { "" },
+            live.every
+        );
+    }
+    let result = (|| -> std::io::Result<()> {
+        loop {
+            match tracer.recv_timeout(output.wait_timeout()) {
+                Ok(report) => {
+                    live.print(&report);
+                    formatted.clear();
+                    if file_output {
+                        // Strict JSONL: dumps are already included in the JSON object.
+                        report.write_jsonl(&mut formatted);
+                        formatted.push('\n');
+                        output.write_record(&formatted)?;
+                    }
+                    if unified_output || !file_output {
+                        formatted.clear();
+                        report.write_pretty(&mut formatted);
+                        for block in &report.dump_blocks {
+                            formatted.push_str(block);
+                        }
+                        if unified_output {
+                            write_unified_kernel(&formatted)?;
+                        } else {
+                            output.write_record(&formatted)?;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            output.flush_due()?;
+            logger::check_output()?;
+            log_trace_output(
+                (file_output || !unified_output).then_some(&output),
+                &mut previous_output,
+                &mut last_output,
+            );
+        }
+        output.flush()?;
+        logger::flush_output()
+    })();
+    stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    tracer.stop();
+    result.map_err(|error| anyhow::anyhow!("输出失败（缓冲数据可能尚未输出）: {error}"))
+}
+
+/// mode=hybrid：trace 事件写到指定文件或终端，主流程继续。
+#[cfg(feature = "kernel-trace")]
+fn start_background_tracer(args: &Args) -> AnyResult<()> {
+    let opts = build_trace_options(args)?;
+    let file_output = args.trace_output.is_some();
+    let unified_output = logger::has_output_file();
+    let mut output = open_trace_output(args.trace_output.as_deref())?;
+    // Fail synchronously on output/lock/load errors before continuing startup.
+    let tracer = kernel_trace::KernelTracer::start(opts)?;
+    let guard = scene::SceneGuard::new(args.spawn.as_deref().unwrap_or("app"));
+    let guard_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    guard.start_watcher(guard_stop.clone());
+
+    std::thread::spawn(move || {
+        trace_bridge::register_tracer(tracer.command_tx());
+        let mut jsonl = String::with_capacity(2048);
+        let mut pretty = String::with_capacity(2048);
+        let mut previous_output = output.stats();
+        let mut last_output = std::time::Instant::now();
+        let mut live = TraceLivePrinter::from_env();
+        if live.enabled() {
+            log_info!(
+                "[trace-live] enabled={}{}{} every={}",
+                if live.svc { "svc " } else { "" },
+                if live.uprobe { "uprobe " } else { "" },
+                if live.hwbp { "hwbp " } else { "" },
+                live.every
+            );
+        }
+        let result = (|| -> std::io::Result<()> {
+            loop {
+                match tracer.recv_timeout(output.wait_timeout()) {
+                    Ok(report) => {
+                        live.print(&report);
+                        jsonl.clear();
+                        report.write_jsonl(&mut jsonl);
+                        // Record before any callback or potentially blocking output.
+                        guard.record_event(report.host_pid, &report.comm, &jsonl);
+                        // HWBP 的完整记录含寄存器、16 条指令、堆栈和映射
+                        // 注释；文件需要全部保留，但实时 JS 回调只发送有
+                        // 用的现场字段，避免每次 jseval 解析数 KB 的重复文本。
+                        if report.event_kind == "hwbp.hit" {
+                            let mut callback_jsonl = String::with_capacity(2048);
+                            report.write_callback_jsonl(&mut callback_jsonl);
+                            trace_bridge::push_hwbp_event_jsonl(&callback_jsonl);
+                        } else {
+                            trace_bridge::push_event_jsonl(&jsonl, report.event_kind == "svc.enter");
+                        }
+                        if unified_output {
+                            pretty.clear();
+                            report.write_pretty(&mut pretty);
+                            for block in &report.dump_blocks {
+                                pretty.push_str(block);
+                            }
+                            write_unified_kernel(&pretty)?;
+                        }
+                        let write_result = if file_output {
+                            // Explicit file output continues even when JS mutes console output.
+                            jsonl.push('\n');
+                            let result = output.write_record(&jsonl);
+                            jsonl.pop();
+                            result
+                        } else if !unified_output && trace_bridge::host_should_print() {
+                            pretty.clear();
+                            report.write_pretty(&mut pretty);
+                            for block in &report.dump_blocks {
+                                pretty.push_str(block);
+                            }
+                            output.write_record(&pretty)
+                        } else {
+                            Ok(())
+                        };
+                        write_result?;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                output.flush_due()?;
+                logger::check_output()?;
+                log_trace_output(
+                    (file_output || !unified_output).then_some(&output),
+                    &mut previous_output,
+                    &mut last_output,
+                );
+            }
+            output.flush()?;
+            logger::flush_output()
+        })();
+        if let Err(error) = result {
+            log_error!("[trace-output] 写入失败，停止追踪（缓冲数据可能尚未输出）: {}", error);
+        }
+        guard_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracer.stop();
+    });
+    Ok(())
 }

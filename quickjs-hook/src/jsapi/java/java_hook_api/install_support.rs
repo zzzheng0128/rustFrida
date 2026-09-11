@@ -197,10 +197,8 @@ pub(super) unsafe fn create_replacement_art_method(
     std::ptr::copy_nonoverlapping(art_method as *const u8, ptr as *mut u8, clone_size);
 
     let repl = ptr as usize;
-    let repl_flags = (original_access_flags
-        & !(K_ACC_CRITICAL_NATIVE | K_ACC_FAST_NATIVE | K_ACC_NTERP_ENTRY_POINT_FAST_PATH))
-        | K_ACC_NATIVE
-        | k_acc_compile_dont_bother();
+    let repl_flags =
+        (original_access_flags & !k_acc_native_runtime_flags_mask()) | K_ACC_NATIVE | k_acc_compile_dont_bother();
     std::ptr::write_volatile((repl + spec.access_flags_offset) as *mut u32, repl_flags);
     std::ptr::write_volatile((repl + data_off) as *mut u64, thunk as u64);
     std::ptr::write_volatile((repl + ep_offset) as *mut u64, jni_trampoline);
@@ -247,10 +245,8 @@ pub(super) unsafe fn create_quick_stack_sentinel_art_method(
             src_declaring_class, source_art_method
         ));
     }
-    let repl_flags = (src_flags & !(K_ACC_CRITICAL_NATIVE | K_ACC_FAST_NATIVE | K_ACC_NTERP_ENTRY_POINT_FAST_PATH))
-        | K_ACC_NATIVE
-        | K_ACC_STATIC
-        | k_acc_compile_dont_bother();
+    let repl_flags =
+        (src_flags & !k_acc_native_runtime_flags_mask()) | K_ACC_NATIVE | K_ACC_STATIC | k_acc_compile_dont_bother();
     std::ptr::write_volatile((repl + spec.access_flags_offset) as *mut u32, repl_flags);
     std::ptr::write_volatile((repl + data_off) as *mut u64, 0);
     std::ptr::write_volatile((repl + ep_offset) as *mut u64, stack_entry_point);

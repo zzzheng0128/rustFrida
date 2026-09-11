@@ -68,9 +68,8 @@ fn quick_trampoline_entry_valid(art_method_addr: u64, quick_trampoline: u64) -> 
     if original_entry_point == 0 {
         return true;
     }
-    let live_ep = unsafe {
-        std::ptr::read_volatile((art_method_addr as usize + spec.entry_point_offset) as *const u64)
-    };
+    let live_ep =
+        unsafe { std::ptr::read_volatile((art_method_addr as usize + spec.entry_point_offset) as *const u64) };
     live_ep == original_entry_point
 }
 

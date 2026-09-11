@@ -14,19 +14,21 @@ pub enum RelocStatus {
 /// 最后把（改写或原样）的 4 字节指令写到 dst_addr。
 /// ⚠️ 需保证这两个地址可读/可写且 4 字节对齐。
 pub unsafe fn relocate_one_a64(src_addr: usize, dst_addr: usize) -> RelocStatus {
-    let insn: u32 = core::ptr::read_volatile(src_addr as *const u32).swap_bytes();
+    // Android arm64 is little-endian: the value read from executable memory
+    // is already the canonical A64 encoding used by the relocation helpers.
+    let insn: u32 = core::ptr::read_volatile(src_addr as *const u32);
     write_stream(format!("relocate_one_a64: {:x}\n", insn).as_bytes());
     match relocate_pc_relative(src_addr, dst_addr, insn) {
         TryPatch::Patched(p) => {
-            core::ptr::write_volatile(dst_addr as *mut u32, p.swap_bytes());
+            core::ptr::write_volatile(dst_addr as *mut u32, p);
             RelocStatus::Patched
         }
         TryPatch::OutOfRange => {
-            core::ptr::write_volatile(dst_addr as *mut u32, insn.swap_bytes());
+            core::ptr::write_volatile(dst_addr as *mut u32, insn);
             RelocStatus::UnchangedOutOfRange
         }
         TryPatch::NotMatch => {
-            core::ptr::write_volatile(dst_addr as *mut u32, insn.swap_bytes());
+            core::ptr::write_volatile(dst_addr as *mut u32, insn);
             RelocStatus::UnchangedNotPcRelative
         }
     }

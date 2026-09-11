@@ -182,10 +182,7 @@ unsafe fn extract_signature_arg(
         return extract_string_arg(ctx, arg, b"signature must be a string or [params, ret]\0");
     }
     if ffi::JS_IsArray(ctx, arg.raw()) == 0 {
-        let msg = format!(
-            "{} must be a JNI signature string or [params, returnType]",
-            name
-        );
+        let msg = format!("{} must be a JNI signature string or [params, returnType]", name);
         return Err(throw_internal_error(ctx, msg));
     }
 

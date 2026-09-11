@@ -232,11 +232,15 @@ async fn run_monitor(
 
     let program: &mut UProbe = ebpf.program_mut("ldmonitor").unwrap().try_into()?;
     program.load()?;
+    use aya::programs::uprobe::UProbeScope;
+    let scope = match target_pid {
+        Some(p) => UProbeScope::OneProcess(std::num::NonZeroU32::new(p).unwrap()),
+        None => UProbeScope::AllProcesses,
+    };
     program.attach(
-        Some("android_dlopen_ext"),
-        0, // offset
+        "android_dlopen_ext",
         "/apex/com.android.runtime/lib64/bionic/libdl.so",
-        target_pid.map(|p| p as i32),
+        scope,
     )?;
 
     let mut perf_array = PerfEventArray::try_from(ebpf.take_map("EVENTS").unwrap())?;
@@ -249,9 +253,7 @@ async fn run_monitor(
 
         tokio::spawn(async move {
             let mut async_fd = AsyncFd::new(buf).unwrap();
-            let mut buffers = (0..10)
-                .map(|_| BytesMut::with_capacity(core::mem::size_of::<DlopenEvent>()))
-                .collect::<Vec<_>>();
+            let mut sample_buf: Vec<u8> = Vec::with_capacity(core::mem::size_of::<DlopenEvent>());
 
             loop {
                 if stop_flag_clone.load(Ordering::SeqCst) {
@@ -259,14 +261,30 @@ async fn run_monitor(
                 }
 
                 let mut guard = async_fd.readable_mut().await.unwrap();
-                let events = guard.get_inner_mut().read_events(&mut buffers).unwrap();
-                for buf in buffers.iter().take(events.read) {
-                    let event = unsafe { &*(buf.as_ptr() as *const DlopenEvent) };
-                    let info = DlopenInfo::from(event);
-                    if sender_clone.send(info).is_err() {
-                        return; // receiver dropped
+                guard.get_inner_mut().for_each(|event| {
+                    use aya::maps::perf::PerfEvent;
+                    match event {
+                        PerfEvent::Sample { head, tail } => {
+                            let bytes: &[u8] = if tail.is_empty() {
+                                head
+                            } else {
+                                sample_buf.clear();
+                                sample_buf.extend_from_slice(head);
+                                sample_buf.extend_from_slice(tail);
+                                &sample_buf
+                            };
+                            if bytes.len() < core::mem::size_of::<DlopenEvent>() {
+                                return;
+                            }
+                            let event = unsafe { &*(bytes.as_ptr() as *const DlopenEvent) };
+                            let info = DlopenInfo::from(event);
+                            let _ = sender_clone.send(info);
+                        }
+                        PerfEvent::Lost { count } => {
+                            log::warn!("ldmonitor perf buffer lost {} events", count);
+                        }
                     }
-                }
+                });
                 guard.clear_ready();
             }
         });

@@ -286,7 +286,12 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
     // 1. 确保 zymbiote 已加载到所有 zygote 进程
     ensure_zymbiote_loaded()?;
 
-    // 2. 解析启动目标并注册 spawn 请求。
+    // 2. 解析启动目标，并先停止旧实例。
+    //
+    // 必须在注册请求之前完成 force-stop：如果旧实例正在从 zygote
+    // 出场，先注册再停止会让旧实例的 hello 抢走本轮请求，随后监控到
+    // 它被杀掉，而真正的新实例却没有被注入（表现为 target_signaled、
+    // 但 logcat 里又出现了一个新的 PID）。
     //    --spawn com.foo 按 launcher Activity 的 android:process 精确匹配；
     //    --spawn com.foo:remote 表示显式指定子进程，仍启动 com.foo 包。
     let target = resolve_spawn_target(package);
@@ -295,6 +300,7 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
     } else {
         log_verbose!("主进程解析: {} 使用默认包进程", target.package);
     }
+    stop_app(&target.package)?;
     let notifier = Arc::new(SpawnNotifier::new());
     {
         let requests = SPAWN_REQUESTS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -310,9 +316,9 @@ fn spawn_and_wait_hello(package: &str) -> Result<SpawnHello, String> {
         }
     }
 
-    // 3. 强制停止并启动目标应用
+    // 3. 请求已登记后再启动，期间不会再 force-stop，避免旧 hello 串入。
     log_info!("正在启动应用 {}...", target.package);
-    launch_app(&target.package)?;
+    start_app(&target.package)?;
 
     // 4. 等待 SpawnHello（20s 超时）
     log_info!("等待进程 {} 启动... (最长 20s)", target.process_name);
@@ -964,9 +970,8 @@ fn resolve_launch_process_name(package: &str) -> Option<String> {
     resolve_application_process_from_manifest(package)
 }
 
-/// 启动应用：先 force-stop，再启动（与 Frida 分离 stop/start 一致）
-fn launch_app(package: &str) -> Result<(), String> {
-    // 1. 先显式 force-stop（与 Frida stop_package 一致，分离 stop 和 start）
+/// 停止应用并等待 AMS 清理旧进程。
+fn stop_app(package: &str) -> Result<(), String> {
     log_verbose!("正在停止应用 {}...", package);
     let stop_result = std::process::Command::new("am")
         .args(["force-stop", package])
@@ -980,6 +985,14 @@ fn launch_app(package: &str) -> Result<(), String> {
         );
     }
 
+    // force-stop 是异步的；给 AMS 一个很短的窗口完成进程回收，避免
+    // 旧进程的 zygote hello 与下一次 spawn 请求交错。
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    Ok(())
+}
+
+/// 启动应用，不再重复 force-stop。
+fn start_app(package: &str) -> Result<(), String> {
     // 2. 尝试解析 launch activity 组件名
     let component = resolve_launch_activity(package);
 
@@ -1039,6 +1052,12 @@ fn launch_app(package: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// 启动应用：先 force-stop，再启动（诊断路径使用）。
+fn launch_app(package: &str) -> Result<(), String> {
+    stop_app(package)?;
+    start_app(package)
 }
 
 /// 解析应用的 launch activity 组件名（如 com.example.app/.MainActivity）

@@ -22,8 +22,8 @@ use crate::communication::{send_command, start_socketpair_handler};
 use crate::injection::inject_via_bootstrapper;
 use crate::process::find_pid_by_name;
 use crate::repl::{
-    cut_pre_resume_java_executor_hook, ensure_java_worker_ready, ensure_java_worker_ready_after_resume,
-    preconfigure_java_stealth_if_declared, print_eval_result, print_help, rewrite_jseval_for_agent, run_js_repl,
+    cut_pre_resume_java_executor_hook, ensure_java_worker_ready, preconfigure_java_stealth_if_declared,
+    print_eval_result, print_help, rewrite_jseval_for_agent, run_js_repl, schedule_java_worker_ready_after_resume,
     script_uses_java_api, try_jseval_on_main_thread_if_java_or_dsl, try_loadjs_on_main_thread_if_java,
     try_managedcounter_on_main_thread, EVAL_DEFAULT_TIMEOUT_SECS, EVAL_JAVA_TIMEOUT_SECS, EVAL_RECOMP_TIMEOUT_SECS,
     LOAD_DEFAULT_TIMEOUT_SECS, LOAD_JAVA_TIMEOUT_SECS, LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS,
@@ -246,12 +246,14 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
                         return ScriptLoadState::Failed;
                     }
                     Some(Err(e)) => {
-                        log_error!("[#{}] pre-resume Java 脚本执行失败: {}", session.id, e);
+                        let message = format!("pre-resume Java 脚本执行失败: {e}");
+                        crate::logger::agent_line(session.id, &message, &message);
                         return ScriptLoadState::Failed;
                     }
                     Some(Ok(out)) => {
                         if !out.is_empty() {
-                            log_success!("[#{}] => {}", session.id, out);
+                            let message = format!("=> {out}");
+                            crate::logger::agent_line(session.id, &message, &message);
                         }
                     }
                 }
@@ -273,10 +275,14 @@ fn load_script_on_session(session: &Session, script_path: &str, stop_worker_afte
                     LOAD_DEFAULT_TIMEOUT_SECS
                 })) {
                 None => log_warn!("[#{}] 脚本加载超时", session.id),
-                Some(Err(e)) => log_error!("[#{}] 脚本执行失败: {}", session.id, e),
+                Some(Err(e)) => {
+                    let message = format!("脚本执行失败: {e}");
+                    crate::logger::agent_line(session.id, &message, &message);
+                }
                 Some(Ok(out)) => {
                     if !out.is_empty() {
-                        log_success!("[#{}] => {}", session.id, out);
+                        let message = format!("=> {out}");
+                        crate::logger::agent_line(session.id, &message, &message);
                     }
                 }
             }
@@ -359,13 +365,7 @@ fn do_spawn(
                     if let Err(e) = spawn::resume_child(pid as u32) {
                         log_error!("[#{}] 恢复子进程失败: {}", sid, e);
                     }
-                    if let Err(e) = ensure_java_worker_ready_after_resume(&session, post_resume_java_worker_needed) {
-                        log_warn!(
-                            "[#{}] Java worker 启动失败，后续 Java 操作需要重新初始化 worker: {}",
-                            sid,
-                            e
-                        );
-                    }
+                    schedule_java_worker_ready_after_resume(session.clone(), post_resume_java_worker_needed);
 
                     log_success!("[#{}] {} 已就绪 (PID: {})", sid, package, pid);
                 }
@@ -445,7 +445,7 @@ fn run_session_repl(session: &Arc<Session>) -> bool {
 
     let label = session.label.lock().unwrap().clone();
     let prompt = format!("rustfrida#{}> ", session.id);
-    println!(
+    crate::console_log!(
         "  {DIM}[#{}] {} (PID: {}) — 输入 back 返回 server, help 查看命令{RESET}",
         session.id,
         label,
@@ -587,26 +587,26 @@ fn run_session_repl(session: &Arc<Session>) -> bool {
 
 fn print_server_help() {
     use crate::logger::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
-    println!("\n{BOLD}{CYAN}Server 命令:{RESET}");
-    println!("{DIM}  {:<12} {:<28} {}{RESET}", "命令", "参数", "说明");
-    println!("{DIM}  {:-<12} {:-<28} {:-<20}{RESET}", "", "", "");
+    crate::console_log!("\n{BOLD}{CYAN}Server 命令:{RESET}");
+    crate::console_log!("{DIM}  {:<12} {:<28} {}{RESET}", "命令", "参数", "说明");
+    crate::console_log!("{DIM}  {:-<12} {:-<28} {:-<20}{RESET}", "", "", "");
     for (cmd, args, desc) in SERVER_CMDS {
-        println!("  {BOLD}{GREEN}{:<12}{RESET} {YELLOW}{:<28}{RESET} {}", cmd, args, desc);
+        crate::console_log!("  {BOLD}{GREEN}{:<12}{RESET} {YELLOW}{:<28}{RESET} {}", cmd, args, desc);
     }
-    println!();
-    println!("{DIM}  进入 session 后可使用全部 agent 命令 (jsinit/loadjs/jsrepl/hook 等){RESET}");
-    println!("{DIM}  spawn/attach 在后台运行，可以同时发起多个注入{RESET}");
-    println!();
+    crate::console_log!();
+    crate::console_log!("{DIM}  进入 session 后可使用全部 agent 命令 (jsinit/loadjs/jsrepl/hook 等){RESET}");
+    crate::console_log!("{DIM}  spawn/attach 在后台运行，可以同时发起多个注入{RESET}");
+    crate::console_log!();
 }
 
 fn print_sessions(mgr: &SessionManager) {
     use crate::logger::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
     let sessions = mgr.list_sessions();
     if sessions.is_empty() {
-        println!("{DIM}  无活跃 session{RESET}");
+        crate::console_log!("{DIM}  无活跃 session{RESET}");
         return;
     }
-    println!("\n{BOLD}{CYAN}Sessions:{RESET}");
+    crate::console_log!("\n{BOLD}{CYAN}Sessions:{RESET}");
     for (id, pid, label, status, active) in &sessions {
         let marker = if *active { " *" } else { "  " };
         let status_color = match *status {
@@ -614,12 +614,15 @@ fn print_sessions(mgr: &SessionManager) {
             "connecting" => YELLOW,
             _ => RED,
         };
-        println!(
+        crate::console_log!(
             "{marker} {BOLD}#{:<3}{RESET} {:<30} PID:{:<8} {status_color}[{}]{RESET}",
-            id, label, pid, status,
+            id,
+            label,
+            pid,
+            status,
         );
     }
-    println!();
+    crate::console_log!();
 }
 
 /// Server daemon 主入口
@@ -662,11 +665,13 @@ pub(crate) fn run_server(args: &Args) {
         }
     }
 
-    println!("\n  {BOLD}{CYAN}Server 模式已启动{RESET} {DIM}— 输入 help 查看命令, spawn/attach 开始注入{RESET}");
+    crate::console_log!(
+        "\n  {BOLD}{CYAN}Server 模式已启动{RESET} {DIM}— 输入 help 查看命令, spawn/attach 开始注入{RESET}"
+    );
     if args.profile.is_some() {
         log_info!("属性 profile 已加载，spawn 的进程将自动应用");
     }
-    println!();
+    crate::console_log!();
 
     let mut rl = match Editor::new() {
         Ok(e) => e,
@@ -840,7 +845,7 @@ pub(crate) fn run_server(args: &Args) {
             }
             Err(ReadlineError::Interrupted) => {
                 // Ctrl+C: 不立即退出，提示用户
-                println!();
+                crate::console_log!();
                 log_info!("按 Ctrl+C 收到中断 — 输入 exit 退出 server");
             }
             Err(ReadlineError::Eof) => {

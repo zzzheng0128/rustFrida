@@ -4,8 +4,8 @@ use libc::{
 };
 use std::arch::asm;
 use std::ptr::null_mut;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 static THREAD_EXIT_CALLBACK: AtomicUsize = AtomicUsize::new(0);
 

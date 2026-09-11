@@ -262,7 +262,9 @@ pub(crate) unsafe extern "C" fn cleanup_current_thread() {
         if destructor == 0 {
             None
         } else {
-            Some(std::mem::transmute::<usize, crate::pthread_tls::TlsDestructor>(destructor))
+            Some(std::mem::transmute::<usize, crate::pthread_tls::TlsDestructor>(
+                destructor,
+            ))
         }
     });
 }

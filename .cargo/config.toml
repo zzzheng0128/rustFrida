@@ -1,26 +1,15 @@
-##windows
-#[target.aarch64-linux-android]
-#linker = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
-#ar = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-#
-#[build]
-#target = "aarch64-linux-android"
-#rustflags = ["-l","clang_rt.builtins-aarch64","-L","E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/lib64/clang/14.0.6/lib/baremetal"]
-#
-#[env]
-#BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/sysroot"
-#CC_aarch64-linux-android = "E:/androidSdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android30-clang.cmd"
-
-#linux
+# NDK 路径：darwin-x86_64 上以 /Users/freeman/Library/Android/sdk/ndk 为准
 [build]
 target = "aarch64-linux-android"
 
 [target.aarch64-linux-android]
-linker = "/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-ar = "/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-rustflags = ["-l","clang_rt.builtins-aarch64","-L","/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/14.0.6/lib/baremetal"]
+linker = "/Users/freeman/Library/Android/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
+ar = "/Users/freeman/Library/Android/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-ar"
+rustflags = [
+  "-l", "clang_rt.builtins-aarch64",
+  "-L", "/Users/freeman/Library/Android/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/darwin-x86_64/lib/clang/18/lib/baremetal",
+]
 
 [env]
-CC_aarch64-linux-android = "/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang"
-#CFLAGS_aarch64-linux-android = "--sysroot=/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
-BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/home/wwb/Android/Sdk/ndk/25.0.8775105/toolchains/llvm/prebuilt/linux-x86_64/sysroot/"
+CC_aarch64-linux-android = "/Users/freeman/Library/Android/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android30-clang"
+BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=/Users/freeman/Library/Android/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/darwin-x86_64/sysroot"
