@@ -83,9 +83,7 @@ fn pop_native_hook_frame(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) -
                 frame.orig_called
             }
             None => {
-                crate::jsapi::console::output_message(
-                    "[rustfrida INTERNAL] native hook frame stack empty on pop\n",
-                );
+                crate::jsapi::console::output_message("[rustfrida INTERNAL] native hook frame stack empty on pop\n");
                 false
             }
         }

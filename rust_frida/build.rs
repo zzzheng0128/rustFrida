@@ -3,10 +3,27 @@ use std::path::{Path, PathBuf};
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let workspace_root = manifest_dir.parent().expect("rust_frida must be inside workspace root");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+
+    // CARGO_TARGET_DIR may point at a separate workspace-local directory.
+    // Keep the embedded agent beside the host binary instead of silently
+    // reading the legacy workspace `target/` copy.
+    let target_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace_root.join(path)
+            }
+        })
+        .unwrap_or_else(|| workspace_root.join("target"));
+    let agent_path = target_root.join(&target).join(&profile).join("libagent.so");
+    println!("cargo:rustc-env=AGENT_SO_PATH={}", agent_path.display());
+    println!("cargo:rerun-if-changed={}", agent_path.display());
 
     // 当 agent.so 或 helper shellcode 变化时重新编译 host（include_bytes! 缓存问题）
-    println!("cargo:rerun-if-changed=../target/aarch64-linux-android/debug/libagent.so");
-    println!("cargo:rerun-if-changed=../target/aarch64-linux-android/release/libagent.so");
     println!("cargo:rerun-if-changed=../loader/build/bootstrapper.bin");
     println!("cargo:rerun-if-changed=../loader/build/rustfrida-loader.bin");
 
@@ -26,7 +43,6 @@ fn main() {
         println!("cargo:rerun-if-changed=../{}", input);
     }
 
-    let target = std::env::var("TARGET").unwrap_or_default();
     if target == "aarch64-linux-android" && helpers_are_stale(workspace_root) {
         let status = std::process::Command::new("python3")
             .arg(workspace_root.join("loader/build_helpers.py"))
@@ -40,12 +56,11 @@ fn main() {
 
     if std::env::var_os("CARGO_FEATURE_QBDI").is_some() {
         let profile = std::env::var("PROFILE").expect("PROFILE not set");
-        let helper_path = format!(
-            "{}/target/{}/{}/libqbdi_helper.so",
-            workspace_root.display(),
-            target,
-            if profile == "release" { "release" } else { "debug" }
-        );
+        let helper_path = target_root
+            .join(&target)
+            .join(if profile == "release" { "release" } else { "debug" })
+            .join("libqbdi_helper.so");
+        let helper_path = helper_path.display().to_string();
         println!("cargo:rustc-env=QBDI_HELPER_SO_PATH={}", helper_path);
         println!("cargo:rerun-if-changed={}", helper_path);
     }

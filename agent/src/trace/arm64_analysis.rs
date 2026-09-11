@@ -45,41 +45,42 @@ pub struct BranchRegUsage {
 }
 
 pub fn is_arm64_branch(code: u32) -> bool {
-    let swapped = code.swap_bytes();
-    let op6 = swapped >> 26;
+    // `read_volatile` on Android arm64 already returns the little-endian
+    // instruction word (the same encoding used by the assembler/codegen).
+    // Swapping here turns every normal A64 opcode into a different value.
+    let op6 = code >> 26;
     if op6 == 0b000101 || op6 == 0b100101 {
         // B, BL
         return true;
     }
-    let op8 = swapped >> 24;
+    let op8 = code >> 24;
     if op8 == 0b01010100 {
         // B.cond
         return true;
     }
-    let op10 = swapped >> 22;
+    let op10 = code >> 22;
     if op10 == 0b1101011000 || op10 == 0b1101011001 || op10 == 0b1101011010 {
         // BR, BLR, RET
         return true;
     }
     // CBZ/CBNZ
-    if (swapped & 0x7F000000) == 0x34000000 || (swapped & 0x7F000000) == 0x35000000 {
+    if (code & 0x7F000000) == 0x34000000 || (code & 0x7F000000) == 0x35000000 {
         return true;
     }
     // TBZ/TBNZ
-    if (swapped & 0xFF000000) == 0x36000000 || (swapped & 0xFF000000) == 0x37000000 {
+    if (code & 0xFF000000) == 0x36000000 || (code & 0xFF000000) == 0x37000000 {
         return true;
     }
     false
 }
 
 pub fn is_arm64_call(instr: u32) -> bool {
-    let swapped = instr.swap_bytes();
     // BL: 高6位 0b100101
-    if (swapped >> 26) == 0b100101 {
+    if (instr >> 26) == 0b100101 {
         return true;
     }
     // BLR: 高10位 0b11010110001
-    if (swapped >> 21) == 0b11010110001 {
+    if (instr >> 21) == 0b11010110001 {
         return true;
     }
     false
@@ -118,7 +119,9 @@ fn parse_conditional_branch(instr: u32, pc: usize, _regs: &UserRegs) -> Option<A
 
         return Some(Arm64BranchType::ConditionalBranch {
             taken: branch_target,
-            not_taken: next_target,
+            // A conditional branch falls through to the instruction after
+            // the branch itself. `pc` is the address of the branch.
+            not_taken: next_target.wrapping_add(4),
         });
     }
     None
@@ -137,7 +140,7 @@ fn parse_compare_branch(instr: u32, pc: usize, _regs: &UserRegs) -> Option<Arm64
 
         return Some(Arm64BranchType::CompareBranch {
             taken: branch_target,
-            not_taken: next_target,
+            not_taken: next_target.wrapping_add(4),
         });
     }
     None
@@ -156,7 +159,7 @@ fn parse_test_bit_branch(instr: u32, pc: usize, _regs: &UserRegs) -> Option<Arm6
 
         return Some(Arm64BranchType::TestBitBranch {
             taken: branch_target,
-            not_taken: next_target,
+            not_taken: next_target.wrapping_add(4),
         });
     }
     None
@@ -257,10 +260,14 @@ fn resolve_branch_target(branch_type: Arm64BranchType, instr: u32, regs: &UserRe
 pub unsafe fn resolve_next_addr(instr_ptr: *const u32, regs: UserRegs) -> Option<usize> {
     use core::ptr;
 
-    let instr = ptr::read_volatile(instr_ptr).swap_bytes();
+    let instr = ptr::read_volatile(instr_ptr);
     write_stream(format!("instruct: {:x}", instr).as_bytes());
 
-    let pc = (instr_ptr as usize).wrapping_add(4);
+    // A64 PC-relative branch immediates are based on the address of the
+    // branch instruction. The previous +4 here shifted every direct target
+    // by one instruction; for conditional branches it also accidentally made
+    // the fall-through address look correct, hiding the direct-target bug.
+    let pc = instr_ptr as usize;
 
     let branch_type = parse_unconditional_branch(instr, pc)
         .or_else(|| parse_conditional_branch(instr, pc, &regs))
@@ -274,11 +281,10 @@ pub unsafe fn resolve_next_addr(instr_ptr: *const u32, regs: UserRegs) -> Option
 /// 分析一条跳转指令涉及的寄存器
 pub fn analyze_branch_regs(instr: u32) -> BranchRegUsage {
     let mut usage = BranchRegUsage::default();
-    let swapped = instr.swap_bytes();
 
-    let op6 = swapped >> 26;
-    let op8 = swapped >> 24;
-    let op10 = swapped >> 21;
+    let op6 = instr >> 26;
+    let op8 = instr >> 24;
+    let op10 = instr >> 21;
 
     // 1. B, BL（无条件跳转/带链接）
     if op6 == 0b000101 {
@@ -291,27 +297,27 @@ pub fn analyze_branch_regs(instr: u32) -> BranchRegUsage {
         usage.read_flags = true;
     }
     // 3. CBZ/CBNZ（比较寄存器是否为0）
-    else if ((swapped >> 25) & 0x3F) == 0b011010 || ((swapped >> 25) & 0x3F) == 0b011011 {
-        let reg = (swapped & 0x1F) as u8;
+    else if ((instr >> 25) & 0x3F) == 0b011010 || ((instr >> 25) & 0x3F) == 0b011011 {
+        let reg = (instr & 0x1F) as u8;
         usage.read_regs = reg;
     }
     // 4. TBZ/TBNZ（测试寄存器某一位）
-    else if ((swapped >> 25) & 0x3E) == 0b011010 || ((swapped >> 25) & 0x3E) == 0b011110 {
-        let reg = (swapped & 0x1F) as u8;
+    else if ((instr >> 25) & 0x3E) == 0b011010 || ((instr >> 25) & 0x3E) == 0b011110 {
+        let reg = (instr & 0x1F) as u8;
         usage.read_regs = reg;
     }
     // 5. BR/BLR/RET（间接跳转）
     else if op10 == 0b1101011000 {
         // BR
-        let reg = ((swapped >> 5) & 0x1F) as u8;
+        let reg = ((instr >> 5) & 0x1F) as u8;
         usage.read_regs = reg;
     } else if op10 == 0b1101011001 {
         // BLR
-        let reg = ((swapped >> 5) & 0x1F) as u8;
+        let reg = ((instr >> 5) & 0x1F) as u8;
         usage.read_regs = reg;
     } else if op10 == 0b1101011010 {
         // RET
-        let reg = ((swapped >> 5) & 0x1F) as u8;
+        let reg = ((instr >> 5) & 0x1F) as u8;
         usage.read_regs = reg;
     }
 

@@ -773,7 +773,7 @@ pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {
                 } else {
                     "?".to_string()
                 };
-                println!("  PID {:6}: {}", pid, display);
+                crate::logger::text_line(&format!("  PID {:6}: {}", pid, display));
             }
             Err(format!("找到 {} 个匹配进程，请使用 --pid <n> 精确指定", matches.len()))
         }

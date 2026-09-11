@@ -261,12 +261,8 @@ struct CallbackEntrySnapshot {
 #[cfg(feature = "engine-depth-diagnostics")]
 impl CallbackEntrySnapshot {
     fn capture(target: u64) -> Self {
-        let (depth_cell, depth) = JS_ENGINE_ENTRY_DEPTH.with(|d| {
-            (d as *const _ as usize, d.get())
-        });
-        let (guards_cell, guards) = JS_ENGINE_TLS_GUARDS.with(|s| {
-            (s as *const _ as usize, s.borrow().len())
-        });
+        let (depth_cell, depth) = JS_ENGINE_ENTRY_DEPTH.with(|d| (d as *const _ as usize, d.get()));
+        let (guards_cell, guards) = JS_ENGINE_TLS_GUARDS.with(|s| (s as *const _ as usize, s.borrow().len()));
         Self {
             target,
             ktid: unsafe { libc::gettid() } as i64,
@@ -409,11 +405,7 @@ fn dump_depth_events(max: usize) -> String {
 ///   3. 同线程持锁嵌套（无挂起记录、depth>0）：沿用外层基准——锁在本线程
 ///      手里，期间没有其它线程能进 JS，基准必然还是自己的。
 pub(crate) unsafe fn note_js_engine_entry(ctx: *mut ffi::JSContext, site: &'static str) {
-    let suspended = JS_SUSPENDED_FRAMES.with(|s| {
-        s.borrow()
-            .last()
-            .map(|st| (st.stack_top, st.stack_limit))
-    });
+    let suspended = JS_SUSPENDED_FRAMES.with(|s| s.borrow().last().map(|st| (st.stack_top, st.stack_limit)));
     if let Some((stack_top, stack_limit)) = suspended {
         ffi::qjs_restore_stack_check_state(ctx, stack_top, stack_limit);
     } else {
@@ -588,9 +580,7 @@ pub(crate) unsafe fn reacquire_js_engine_after_external_call(ctx: *mut ffi::JSCo
     };
     let saved = JS_SUSPENDED_FRAMES.with(|s| s.borrow_mut().pop());
     let Some(saved) = saved else {
-        output_message(
-            "[rustfrida INTERNAL] engine reacquired after yield but no suspended state in TLS, aborting\n",
-        );
+        output_message("[rustfrida INTERNAL] engine reacquired after yield but no suspended state in TLS, aborting\n");
         std::process::abort();
     };
     let cur_generation = crate::js_engine_generation();

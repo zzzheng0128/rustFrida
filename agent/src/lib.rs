@@ -11,6 +11,8 @@ macro_rules! define_sync_cell {
     };
 }
 
+#[path = "../../shared/agent_log.rs"]
+mod agent_log;
 mod arm64_relocator;
 mod communication;
 mod crash_handler;
@@ -47,6 +49,24 @@ use std::process;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+// Host -> agent 控制帧目前只有命令和 QBDI helper 两种。限制单帧大小可以
+// 避免损坏的长度字段触发超大分配；正常的 JS/Dex/QBDI 载荷远小于这个值。
+const MAX_CONTROL_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+fn frame_preview(payload: &[u8]) -> String {
+    payload
+        .iter()
+        .take(16)
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn should_report_frame_count(count: u64) -> bool {
+    count <= 3 || count.is_power_of_two()
+}
 
 #[no_mangle]
 pub extern "C" fn rust_get_hide_result() -> *const c_void {
@@ -133,8 +153,15 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     install_panic_hook();
     SHOULD_EXIT.store(false, Ordering::Relaxed);
     SHOULD_DETACH.store(false, Ordering::Relaxed);
-    // Keep native crash handlers disabled for this target.
-    // install_crash_handlers();
+    // SIGSEGV/SIGBUS 继续交给 ART/libsigchain；其余 agent 自身信号可按需记录。
+    // 默认关闭是为了不改变目标应用的异常链，压测时可显式设置
+    // RF_AGENT_CRASH_HANDLER=1 观察 agent 自身 SIGABRT/SIGILL 等故障。
+    let crash_handler_enabled = std::env::var("RF_AGENT_CRASH_HANDLER")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if crash_handler_enabled {
+        crash_handler::install_crash_handlers();
+    }
 
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
     let (ctrl_fd, table) = unsafe {
@@ -176,17 +203,27 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
 
     let mut reader = sock;
     let reader_fd_for_raw = reader.as_raw_fd();
+    let mut unknown_frame_count = 0u64;
+    let mut unknown_frame_streak = 0u32;
+    let mut last_unknown_frame_report = Instant::now();
     loop {
         let mut header = [0u8; 5];
         match read_exact_raw_fd(reader_fd_for_raw, &mut header).and_then(|_| {
             let kind = header[0];
             let len = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            if len > MAX_CONTROL_FRAME_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("控制帧过大: kind={} len={} max={}", kind, len, MAX_CONTROL_FRAME_LEN),
+                ));
+            }
             let mut payload = vec![0u8; len];
             read_exact_raw_fd(reader_fd_for_raw, &mut payload)?;
             Ok((kind, payload))
         }) {
             Ok((kind, payload)) => {
                 if is_cmd_frame(kind) {
+                    unknown_frame_streak = 0;
                     if payload.is_empty() {
                         continue;
                     }
@@ -195,10 +232,46 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
                         process_cmd(&cmd);
                     }
                 } else if is_qbdi_helper_frame(kind) {
+                    unknown_frame_streak = 0;
                     #[cfg(feature = "quickjs")]
                     quickjs_loader::install_qbdi_helper(payload);
                 } else {
-                    write_stream(format!("未知 frame kind: {}", kind).as_bytes());
+                    // kind=0 等非法帧不能当作正常命令处理。保留计数和首个
+                    // 字节预览用于定位 framing/版本问题，但按 1、2、4、8...
+                    // 采样，避免损坏连接时把日志线程本身打爆。
+                    unknown_frame_count = unknown_frame_count.saturating_add(1);
+                    unknown_frame_streak = unknown_frame_streak.saturating_add(1);
+                    let now = Instant::now();
+                    if should_report_frame_count(unknown_frame_count)
+                        || now.duration_since(last_unknown_frame_report) >= Duration::from_secs(2)
+                    {
+                        last_unknown_frame_report = now;
+                        write_stream(
+                            format!(
+                                "未知 frame kind: {} len={} count={} preview={}（已限流）",
+                                kind,
+                                payload.len(),
+                                unknown_frame_count,
+                                frame_preview(&payload),
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    // 帧协议没有安全的重同步点。连续非法帧通常意味着
+                    // ctrl fd 生命周期/版本错位；继续读会把 CPU 和日志打满。
+                    if unknown_frame_streak >= 16 {
+                        write_stream(
+                            format!(
+                                "非法控制帧连续达到 {} 次，关闭 agent 通道（kind={} len={}）",
+                                unknown_frame_streak,
+                                kind,
+                                payload.len()
+                            )
+                            .as_bytes(),
+                        );
+                        SHOULD_DETACH.store(true, Ordering::Release);
+                        break;
+                    }
                 }
                 if SHOULD_EXIT.load(Ordering::Relaxed) || SHOULD_DETACH.load(Ordering::Relaxed) {
                     break;
@@ -326,6 +399,22 @@ fn eval_on_java_worker_and_respond(script: String, filename: String, init_engine
 }
 
 #[cfg(feature = "quickjs")]
+fn flush_java_ready_callbacks_and_respond() {
+    // The script was evaluated before resume, so Java.ready's framework gate
+    // may have been missed.  Run the reprobe on the existing managed worker;
+    // do not use java_jseval here because its lazy-start path can create a
+    // second dynamic worker while the first one is still becoming runnable.
+    let expression = "(function(){try{var ready=Java._reprobeClassLoader?Java._reprobeClassLoader():Java._isClassLoaderReady();if(ready&&Java._flushReadyCallbacks)Java._flushReadyCallbacks();return ready;}catch(e){return '[Java.ready] flush error: '+String(e);}})()";
+    // This callback can install a Java hook and run a short native exercise;
+    // use the normal eval timeout instead of the 500 ms interactive fast-fail
+    // budget, otherwise the task remains in-flight while the host retries.
+    match quickjs_loader::eval_on_running_java_worker(expression.to_string(), String::new(), true) {
+        Ok(result) => send_eval_ok(&result),
+        Err(e) => send_eval_err(&e),
+    }
+}
+
+#[cfg(feature = "quickjs")]
 fn start_java_worker_and_respond() {
     match quickjs_loader::start_java_worker() {
         Ok(()) => send_eval_ok("java-worker-ready"),
@@ -425,7 +514,10 @@ where
     F: FnOnce() + Send + 'static,
 {
     JS_TASKS_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-    match raw_thread::spawn_detached(b"JDWP\0", move || {
+    // Keep injected workers distinguishable from Android's real JDWP thread.
+    // Reusing the framework name makes tombstones ambiguous and can trigger
+    // target-side debugger/JDWP detection when several workers are created.
+    match raw_thread::spawn_detached(b"rf-js-worker\0", move || {
         let _raw_clone_js = quickjs_hook::mark_raw_clone_js_thread();
         if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
             let msg = payload
@@ -571,6 +663,14 @@ fn process_cmd(command: &str) {
         }
         #[cfg(feature = "quickjs")]
         Some("javaworker_init") => dispatch_js_task(start_java_worker_and_respond),
+        #[cfg(feature = "quickjs")]
+        // Spawn-resume startup is issued by the host socket thread after the
+        // app is running.  Starting here keeps JNI/dex installation on an
+        // attached managed-capable thread; the raw-clone executor path is
+        // retained for pre-resume tasks and explicit JS work.
+        Some("javaworker_init_managed") => start_java_worker_and_respond(),
+        #[cfg(feature = "quickjs")]
+        Some("java_ready_flush") => flush_java_ready_callbacks_and_respond(),
         #[cfg(feature = "quickjs")]
         Some("javaexecutor_cut") => dispatch_js_task(cut_java_executor_hook_and_respond),
         #[cfg(feature = "quickjs")]

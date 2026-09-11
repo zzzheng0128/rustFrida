@@ -42,8 +42,17 @@ pub(super) const K_ACC_SINGLE_IMPLEMENTATION: u32 = 0x08000000;
 /// kAccFastNative — fast JNI (@FastNative annotation, must clear for our hook)
 /// NOTE: same bit as kAccSkipAccessChecks (mutually exclusive: native vs non-native methods)
 pub(super) const K_ACC_FAST_NATIVE: u32 = 0x00080000;
-/// kAccCriticalNative — critical JNI (@CriticalNative, must clear)
-pub(super) const K_ACC_CRITICAL_NATIVE: u32 = 0x00200000;
+/// kAccCriticalNative — critical JNI (@CriticalNative, must clear).
+///
+/// ART changed this runtime bit in Android 12 (API 31): older releases use
+/// 0x00200000, while current ART uses 0x00100000 and reserves 0x00200000 for
+/// kAccNterpInvokeFastPathFlag. Keep both values so replacement ArtMethods can
+/// clear stale flags, but choose the active value from the device API level
+/// when deciding whether a method really uses the critical-native ABI.
+pub(super) const K_ACC_CRITICAL_NATIVE_LEGACY: u32 = 0x00200000;
+pub(super) const K_ACC_CRITICAL_NATIVE_MODERN: u32 = 0x00100000;
+/// Compatibility name for callers that only need the modern ART value.
+pub(super) const K_ACC_CRITICAL_NATIVE: u32 = K_ACC_CRITICAL_NATIVE_MODERN;
 /// kAccSkipAccessChecks — skip access checks optimization (must clear)
 /// Same bit as kAccFastNative (0x00080000) — they share the bit, different interpretation
 pub(super) const K_ACC_SKIP_ACCESS_CHECKS: u32 = 0x00080000;
@@ -431,6 +440,33 @@ pub(super) fn get_android_api_level() -> i32 {
         let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) };
         s.to_str().unwrap_or("0").parse().unwrap_or(0)
     })
+}
+
+/// Return the CriticalNative runtime bit for the ART version on this device.
+/// Android 12/API 31 moved the bit from the old Miranda slot to the nterp
+/// entry-point slot; using a fixed value misclassifies ordinary native JNI
+/// methods on Pixel 6/Android 15 as critical-native and changes their ABI.
+#[inline]
+pub(super) fn k_acc_critical_native() -> u32 {
+    critical_native_flag_for_api(get_android_api_level())
+}
+
+/// Pure form used by the runtime selector and unit tests.
+#[inline]
+pub(super) const fn critical_native_flag_for_api(api: i32) -> u32 {
+    if api >= 31 {
+        K_ACC_CRITICAL_NATIVE_MODERN
+    } else {
+        K_ACC_CRITICAL_NATIVE_LEGACY
+    }
+}
+
+/// Runtime bits that must not survive on a replacement ArtMethod. Both
+/// historical CriticalNative positions are cleared because the clone may be
+/// consumed by a different ART dispatch path after installation.
+#[inline]
+pub(super) fn k_acc_native_runtime_flags_mask() -> u32 {
+    K_ACC_FAST_NATIVE | K_ACC_CRITICAL_NATIVE_LEGACY | K_ACC_CRITICAL_NATIVE_MODERN | K_ACC_NTERP_ENTRY_POINT_FAST_PATH
 }
 
 /// Get Android version codename from system property ro.build.version.codename (cached).

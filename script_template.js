@@ -1,139 +1,195 @@
 /*
- * script_template.js — rustfrida 脚本通用骨架（QuickJS 引擎，非完整 Frida 兼容）
+ * rustFrida JS 模板
  *
- * 包含经过实测的公共构件，新脚本直接复制此骨架再写业务逻辑：
- *   1. log               统一日志前缀（输出带 [agent] [JS]）
- *   2. isNullPtr         防御式空指针判断（findExportByName 返回值类型不固定）
- *   3. findGlobalExport  多策略全局符号查找（引擎无 Module.findGlobalExportByName）
- *   4. waitForModule     模块等待三件套：已加载直查 + dlopen 钩子 + 热函数寄生轮询
- *                        （引擎无 setTimeout/setImmediate，轮询只能寄生在热函数上）
- *
- * 运行：
- *   adb push script_template.js /data/local/tmp/
- *   attach: su -c '/data/local/tmp/rustfrida --name <包名> -l /data/local/tmp/script_template.js'
- *   spawn : su -c '/data/local/tmp/rustfrida --spawn <包名> -l /data/local/tmp/script_template.js'
+ * 这份文件只放通用辅助函数。复制它以后，把业务代码写在“业务代码”区域。
+ * QuickJS 提供的是 Frida 风格子集，不能假定完整 Frida API 都存在。
  */
 (function () {
     "use strict";
 
-    var TAG = "my-script";
-    function log(m) { console.log("[" + TAG + "] " + m); }
+    var TAG = "demo";
 
-    /* ---------- 1. 空指针防御 ---------- */
-    // findExportByName 等返回的指针对象不一定是完整 NativePointer，
-    // 直接调 .isNull() 可能抛 "TypeError: not a function"，必须这样判。
-    function isNullPtr(p) {
-        if (p === null || p === undefined) return true;
-        if (typeof p === "bigint") return p === BigInt(0);
-        if (typeof p === "number") return p === 0;
-        try { return p.isNull(); } catch (_) { return false; }
+    function log(message) {
+        console.log("[" + TAG + "] " + String(message));
     }
 
-    /* ---------- 2. 全局符号查找 ---------- */
-    // 引擎没有 Module.findGlobalExportByName，只能用 Module.findExportByName(null, name)，
-    // 再兜底逐个模块 enumerateExports（__loader_* 等 linker 内部符号需要这条路）。
-    function findGlobalExport(name) {
+    // NativePointer、number、bigint 和 null 都可能出现在地址 API 的返回值中。
+    function isNullPtr(value) {
+        if (value === null || value === undefined) return true;
+        if (typeof value === "number") return value === 0;
+        if (typeof value === "bigint") return value === BigInt(0);
+        try { return value.isNull(); } catch (_) { return false; }
+    }
+
+    function toPtr(value) {
+        if (value === null || value === undefined) return null;
+        if (typeof value === "object") return value;
+        return ptr(value);
+    }
+
+    function findExport(moduleName, symbolName) {
         try {
-            var global = Module.findExportByName(null, name);
-            if (global !== null) return global;
-        } catch (_) {
-        }
-        var mods = ["libdl.so", "libdl_android.so", "linker64", "linker", "libc.so"];
-        for (var mi = 0; mi < mods.length; ++mi) {
+            var address = Module.findExportByName(moduleName || null, symbolName);
+            if (!isNullPtr(address)) return address;
+        } catch (_) {}
+        return null;
+    }
+
+    // 引擎没有 Module.findGlobalExportByName；先查全局，再查常见 linker 模块。
+    function findGlobalExport(symbolName) {
+        var address = findExport(null, symbolName);
+        if (!isNullPtr(address)) return address;
+        var modules = ["libdl.so", "libdl_android.so", "linker64", "linker", "libc.so"];
+        for (var i = 0; i < modules.length; i++) {
+            address = findExport(modules[i], symbolName);
+            if (!isNullPtr(address)) return address;
+            // 某些 linker 内部符号只能从模块导出表枚举到。
             try {
-                var mod = Process.getModuleByName(mods[mi]);
-                var exports = mod.enumerateExports();
-                for (var ei = 0; ei < exports.length; ++ei) {
-                    if (exports[ei].name === name) return exports[ei].address;
+                var module = Process.getModuleByName(modules[i]);
+                var exports = module.enumerateExports();
+                for (var j = 0; j < exports.length; j++) {
+                    if (exports[j].name === symbolName) return exports[j].address;
                 }
-            } catch (_) {
-            }
+            } catch (_) {}
         }
         return null;
     }
 
-    /* ---------- 3. NativeFunction 便捷封装 ---------- */
-    function nf(name, ret, args) {
-        var p = findGlobalExport(name);
-        if (isNullPtr(p)) return null;
-        return new NativeFunction(p, ret, args);
+    function nativeFunction(symbolName, returnType, argumentTypes) {
+        var address = findGlobalExport(symbolName);
+        if (isNullPtr(address)) return null;
+        try { return new NativeFunction(address, returnType, argumentTypes); }
+        catch (_) { return null; }
     }
 
-    /* ---------- 4. 模块等待（三件套） ---------- */
-    // 用法：waitForModule("libxxx.so", function (base, size) { ...安装 hook... });
-    function waitForModule(targetName, onReady) {
+    // 旧脚本常用的短名称，保留作复制模板时的兼容别名。
+    function nf(symbolName, returnType, argumentTypes) {
+        return nativeFunction(symbolName, returnType, argumentTypes);
+    }
+
+    function findModule(name) {
+        try { return Process.findModuleByName(name); } catch (_) { return null; }
+    }
+
+    function moduleAddress(moduleName, offset) {
+        var module = findModule(moduleName);
+        if (!module) return null;
+        return module.base.add(offset);
+    }
+
+    function readCString(value) {
+        var address = toPtr(value);
+        if (isNullPtr(address)) return "<null>";
+        try { return address.readCString(); } catch (_) { return "<unreadable>"; }
+    }
+
+    function hexBytes(value, length) {
+        var address = toPtr(value);
+        if (isNullPtr(address)) return "<null>";
+        try {
+            var bytes = new Uint8Array(address.readByteArray(length));
+            var out = "";
+            for (var i = 0; i < bytes.length; i++) {
+                out += (i ? " " : "") + ("0" + bytes[i].toString(16)).slice(-2);
+            }
+            return out;
+        } catch (e) {
+            return "<read failed: " + (e.message || e) + ">";
+        }
+    }
+
+    function attach(address, callbacks, label) {
+        if (isNullPtr(address)) {
+            log((label || "target") + ": address not found");
+            return null;
+        }
+        try {
+            var listener = Interceptor.attach(address, callbacks);
+            log((label || "target") + ": attached at " + address);
+            return listener;
+        } catch (e) {
+            log((label || "target") + ": attach failed: " + (e.message || e));
+            return null;
+        }
+    }
+
+    function detach(listener) {
+        if (!listener) return;
+        try { listener.detach(); } catch (_) {}
+    }
+
+    // 模块可能在脚本之后才加载。此实现不使用定时器：优先直查和 dlopen，
+    // 必要时借 openat/epoll_wait 的调用做低频检查。回调只执行一次。
+    function waitForModule(name, onReady) {
         var done = false;
-        function findTarget() {
-            try { return Process.findModuleByName(targetName); } catch (_) { return null; }
-        }
-        function finish(target) {
-            if (done) return;
-            done = true;
-            stopPoll();
-            onReady(target.base, target.size);
-        }
-
-        // (a) 已加载则直接用
-        var existing = findTarget();
-        if (existing !== null) { finish(existing); return; }
-
-        // (b) dlopen 族钩子：常规 System.loadLibrary 路径
-        ["android_dlopen_ext", "dlopen", "__loader_android_dlopen_ext", "__loader_dlopen"]
-            .forEach(function (name) {
-                var loader = findGlobalExport(name);
-                if (isNullPtr(loader)) return;
-                try {
-                    Interceptor.attach(loader, {
-                        onEnter: function (args) {
-                            try { this.path = args[0].readCString(); } catch (_) { this.path = ""; }
-                        },
-                        onLeave: function () {
-                            if (done || String(this.path || "").indexOf(targetName) < 0) return;
-                            var target = findTarget();
-                            if (target !== null) finish(target);
-                        }
-                    });
-                } catch (e) {
-                    log("watch " + name + " failed: " + e);
-                }
-            });
-
-        // (c) 热函数寄生轮询：目标绕过 dlopen 自加载（open+mmap 手动重定位）时兜底。
-        //     openat 文件 IO、epoll_wait 交互期热；1s 节流；
-        //     size 达标才认为加载完成（避免 loader 未映射完就装 hook）。
-        //     不要挂 mmap：启动期过热，attach 等 in-flight 可能挂死 JS worker。
         var pollListeners = [];
         var lastPoll = 0;
+
+        function findTarget() { return findModule(name); }
         function stopPoll() {
-            pollListeners.forEach(function (l) { try { l.detach(); } catch (_) {} });
+            for (var i = 0; i < pollListeners.length; i++) detach(pollListeners[i]);
             pollListeners = [];
         }
-        function pollCheck() {
-            if (done) { stopPoll(); return; }
+        function finish(module) {
+            if (done || !module) return;
+            done = true;
+            stopPoll();
+            onReady(module.base, module.size, module);
+        }
+        function check() {
+            if (done) return;
             var now = Date.now();
             if (now - lastPoll < 1000) return;
             lastPoll = now;
-            var target = findTarget();
-            if (target !== null && target.size >= 0x10000) finish(target);
+            var module = findTarget();
+            if (module && module.size >= 0x1000) finish(module);
         }
-        ["openat", "epoll_wait"].forEach(function (fname) {
-            var fptr = findGlobalExport(fname);
-            if (isNullPtr(fptr)) return;
-            try {
-                pollListeners.push(Interceptor.attach(fptr, { onEnter: function () { pollCheck(); } }));
-            } catch (e) {
-                log("poll hook on " + fname + " failed: " + e);
-            }
+
+        var existing = findTarget();
+        if (existing) { finish(existing); return; }
+
+        ["android_dlopen_ext", "dlopen", "__loader_android_dlopen_ext", "__loader_dlopen"]
+            .forEach(function (symbolName) {
+                var loader = findGlobalExport(symbolName);
+                if (isNullPtr(loader)) return;
+                try {
+                    pollListeners.push(Interceptor.attach(loader, {
+                        onEnter: function (args) {
+                            try { this.path = readCString(args[0]); } catch (_) { this.path = ""; }
+                        },
+                        onLeave: function () {
+                            if (!done && String(this.path || "").indexOf(name) >= 0) finish(findTarget());
+                        }
+                    }));
+                } catch (e) { log("watch " + symbolName + " failed: " + (e.message || e)); }
+            });
+
+        ["openat", "epoll_wait"].forEach(function (symbolName) {
+            var carrier = findGlobalExport(symbolName);
+            if (isNullPtr(carrier)) return;
+            try { pollListeners.push(Interceptor.attach(carrier, { onEnter: check })); }
+            catch (e) { log("poll hook on " + symbolName + " failed: " + (e.message || e)); }
         });
-        log("waiting for " + targetName + " (poll carriers=" + pollListeners.length + ")");
+        log("waiting for " + name + " (poll carriers=" + pollListeners.length + ")");
     }
 
-    /* ================= 业务逻辑写这里 ================= */
+    // 事件很多时只打印少量样本，避免日志反过来影响目标进程。
+    function sample(counter, first, every) {
+        return counter <= (first || 3) || (every > 0 && counter % every === 0);
+    }
 
-    waitForModule("libmetasec_ml.so", function (base, size) {
-        log("target loaded: base=" + base + " size=0x" + size.toString(16));
-        // 例：Interceptor.attach(base.add(0x12345), { onEnter: function (args) { ... } });
-    });
+    /* ==================== 业务代码 ==================== */
 
-    log("standalone loaded");
+    // 示例：attach 模式下读取 libc 的导出地址。
+    // var openat = findExport("libc.so", "openat");
+    // attach(openat, { onEnter: function (args) {
+    //     log("openat path=" + readCString(args[1]));
+    // }}, "libc.openat");
+
+    // 示例：目标库延迟加载时使用 waitForModule。
+    // waitForModule("libexample.so", function (base, size) {
+    //     log("loaded at " + base + ", size=0x" + size.toString(16));
+    // });
+
+    log("loaded; copy this file and replace the example code");
 })();
