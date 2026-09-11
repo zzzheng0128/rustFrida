@@ -110,6 +110,255 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
     Ok(host_fd as RawFd)
 }
 
+/// pidfd_getfd 可用性探测（pidfd_open 是 5.1+，pidfd_getfd 是 5.6+）。
+/// 注意：msm-4.19 等厂商内核回移了 pidfd_open 却没有 pidfd_getfd，
+/// 因此必须以 getfd 端到端成功为准，不能只探测 pidfd_open。
+/// 结果进程内缓存：内核能力在运行期间不会变化。
+fn pidfd_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, std::process::id() as i64, 0) };
+        if pidfd < 0 {
+            return false;
+        }
+        // root 对自身进程取 fd 0（stdin）的 dup，应当成功
+        let fd = unsafe { libc::syscall(SYS_PIDFD_GETFD, pidfd as i32, 0, 0) };
+        unsafe { close(pidfd as i32) };
+        if fd >= 0 {
+            unsafe { close(fd as i32) };
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// 从目标进程已映射的共享库（如 libc.so）dynsym 中解析符号地址。
+/// ELF 头 / program headers / dynamic 段均通过 /proc/<pid>/mem 读取。
+/// dynamic 段里的 d_ptr 在加载期已被 linker 重定位为绝对地址；
+/// 兼容未重定位的情况（值小于 base 时补上 load bias）。
+fn resolve_symbol_in_target_lib(
+    mem: &ProcMem,
+    base: u64,
+    wanted: &str,
+) -> Result<u64, String> {
+    let mut ehdr = [0u8; 64];
+    mem.pread_exact(&mut ehdr, base)
+        .map_err(|e| format!("读取目标 ELF 头失败: {}", e))?;
+    if &ehdr[0..4] != b"\x7fELF" || ehdr[4] != 2 {
+        return Err("目标库非 ELF64".to_string());
+    }
+    let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
+    let e_phentsize = u16::from_le_bytes(ehdr[54..56].try_into().unwrap()) as u64;
+    let e_phnum = u16::from_le_bytes(ehdr[56..58].try_into().unwrap());
+
+    let mut dyn_addr = 0u64;
+    let mut dyn_size = 0u64;
+    for i in 0..e_phnum {
+        let mut ph = [0u8; 56];
+        mem.pread_exact(&mut ph, base + e_phoff + (i as u64) * e_phentsize)
+            .map_err(|e| format!("读取 program header 失败: {}", e))?;
+        if u32::from_le_bytes(ph[0..4].try_into().unwrap()) == 2 {
+            // PT_DYNAMIC
+            dyn_addr = u64::from_le_bytes(ph[16..24].try_into().unwrap()); // p_vaddr
+            dyn_size = u64::from_le_bytes(ph[40..48].try_into().unwrap()); // p_memsz
+            break;
+        }
+    }
+    if dyn_addr == 0 || dyn_size < 16 {
+        return Err("目标库无 PT_DYNAMIC".to_string());
+    }
+
+    let fix = |v: u64| if v < base { v + base } else { v };
+    let mut symtab = 0u64;
+    let mut strtab = 0u64;
+    let mut off = 0u64;
+    while off + 16 <= dyn_size {
+        let mut ent = [0u8; 16];
+        if mem.pread_exact(&mut ent, base + dyn_addr + off).is_err() {
+            break;
+        }
+        let tag = u64::from_le_bytes(ent[0..8].try_into().unwrap());
+        let val = u64::from_le_bytes(ent[8..16].try_into().unwrap());
+        match tag {
+            5 => strtab = fix(val),  // DT_STRTAB
+            6 => symtab = fix(val),  // DT_SYMTAB
+            0 => break,              // DT_NULL
+            _ => {}
+        }
+        off += 16;
+    }
+    if symtab == 0 || strtab == 0 {
+        return Err("目标库无 dynsym/strtab".to_string());
+    }
+
+    // 常见布局 strtab 紧跟 symtab；否则退回一个足够大的上限
+    let nsyms: u64 = if strtab > symtab {
+        (strtab - symtab) / 24
+    } else {
+        8192
+    };
+
+    for i in 0..nsyms {
+        let mut sym = [0u8; 24];
+        if mem.pread_exact(&mut sym, symtab + i * 24).is_err() {
+            break;
+        }
+        let st_name = u32::from_le_bytes(sym[0..4].try_into().unwrap()) as u64;
+        let st_value = u64::from_le_bytes(sym[8..16].try_into().unwrap());
+        if st_value == 0 || st_name == 0 {
+            continue;
+        }
+        // 常见 libc 符号名远短于 32 字节
+        let mut name = [0u8; 32];
+        if mem.pread_exact(&mut name, strtab + st_name).is_err() {
+            continue;
+        }
+        let len = name.iter().position(|&c| c == 0).unwrap_or(32);
+        if &name[..len] == wanted.as_bytes() {
+            return Ok(base + st_value);
+        }
+    }
+    Err(format!("目标库中未找到符号 {}", wanted))
+}
+
+/// 4.x 内核（无 pidfd_getfd）回退：在目标进程内远程调用建立抽象 unix
+/// socket 监听（socket/bind/listen/accept4），host 以 root 身份主动连接，
+/// 连接对即 ctrl 通道。
+///
+/// SELinux 方向（Pixel 5 / Android 14 实测）：
+///   - app 域 bind/listen/accept 抽象 socket：允许（app 自建 socket 常态）
+///   - root(magisk) connect 到 app 的 socket：允许（magisk 域全放行）
+///   - 反方向（app connect root 的 socket）：拒绝（EACCES）
+/// 因此必须由目标侧监听、host 主动连接。
+#[allow(clippy::too_many_arguments)]
+fn establish_ctrl_via_abstract_listener(
+    trace_tid: i32,
+    pid: i32,
+    mem: &ProcMem,
+    data_base: usize,
+    data_size: usize,
+    libc_api: &FridaLibcApi,
+    libc_base: u64,
+) -> Result<(RawFd, i32), String> {
+    const AF_UNIX: usize = 1;
+    const SOCK_STREAM: usize = 1;
+    const SOCK_CLOEXEC: usize = 0x80000;
+    // aarch64 syscall numbers
+    const NR_BIND: usize = 200;
+    const NR_LISTEN: usize = 201;
+    const NR_ACCEPT4: usize = 242;
+    const NR_CLOSE: usize = 57;
+
+    // 数据区最后一页做 scratch（sockaddr），不会与 string table 区域重叠
+    let page = 4096usize;
+    let scratch = data_base + data_size - page;
+
+    // 1. 解析目标 libc 的 syscall() 包装（variadic: x0=nr, x1..x7=args）
+    let syscall_fn = resolve_symbol_in_target_lib(mem, libc_base, "syscall")?;
+    log_verbose!("ctrl 回退: 目标 libc syscall() @ 0x{:x}", syscall_fn);
+
+    // 2. 目标侧 socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0)
+    let s = call_target_function(
+        trace_tid,
+        libc_api.socket as usize,
+        &[AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0],
+        None,
+    )? as i32;
+    if s < 0 {
+        return Err("ctrl 回退: 目标 socket() 失败".to_string());
+    }
+    let close_target_fd = |fd: i32| {
+        let _ = call_target_function(trace_tid, syscall_fn as usize, &[NR_CLOSE, fd as usize], None);
+    };
+
+    // 3. sockaddr_un（抽象名字，防多轮注入重试冲突带随机 nonce）
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let name = format!("rfbf-{}-{}", pid, nonce);
+    let mut sa = [0u8; 110];
+    sa[0] = AF_UNIX as u8; // sun_family = AF_UNIX (LE)
+    sa[1] = 0;
+    // sa[2] = 0 → sun_path[0] = '\0'（抽象地址）
+    sa[3..3 + name.len()].copy_from_slice(name.as_bytes());
+    mem.pwrite_all(&sa, scratch as u64)?;
+    let sa_len = 3 + name.len();
+
+    // 4. 目标侧 bind + listen
+    let r = call_target_function(
+        trace_tid,
+        syscall_fn as usize,
+        &[NR_BIND, s as usize, scratch, sa_len],
+        None,
+    )? as i32;
+    if r < 0 {
+        close_target_fd(s);
+        return Err(format!("ctrl 回退: 目标 bind() 失败 rc={}", r));
+    }
+    let r = call_target_function(
+        trace_tid,
+        syscall_fn as usize,
+        &[NR_LISTEN, s as usize, 1],
+        None,
+    )? as i32;
+    if r < 0 {
+        close_target_fd(s);
+        return Err(format!("ctrl 回退: 目标 listen() 失败 rc={}", r));
+    }
+
+    // 5. host 连接（root → app socket，SELinux 允许的方向）
+    let host_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if host_fd < 0 {
+        close_target_fd(s);
+        return Err(format!(
+            "ctrl 回退: host socket() 失败: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut host_sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    host_sa.sun_family = libc::AF_UNIX as u16;
+    host_sa.sun_path[0] = 0; // abstract
+    host_sa.sun_path[1..1 + name.len()].copy_from_slice(name.as_bytes());
+    let host_len = (2 + 1 + name.len()) as libc::socklen_t; // offsetof(sun_path)+1+name
+    if unsafe {
+        libc::connect(
+            host_fd,
+            &host_sa as *const _ as *const libc::sockaddr,
+            host_len,
+        )
+    } != 0
+    {
+        let err = std::io::Error::last_os_error();
+        unsafe { close(host_fd) };
+        close_target_fd(s);
+        return Err(format!("ctrl 回退: host connect(@{}) 失败: {}", name, err));
+    }
+
+    // 6. 目标侧 accept4（连接已在 backlog，立即返回）
+    let accepted = call_target_function(
+        trace_tid,
+        syscall_fn as usize,
+        &[NR_ACCEPT4, s as usize, 0, 0, SOCK_CLOEXEC],
+        None,
+    )? as i32;
+    // 7. 目标侧关闭 listener（host 端口已建立）
+    close_target_fd(s);
+    if accepted < 0 {
+        unsafe { close(host_fd) };
+        return Err(format!("ctrl 回退: 目标 accept4() 失败 rc={}", accepted));
+    }
+
+    log_verbose!(
+        "ctrl 回退通道建立: host fd={}, target fd={} (@{})",
+        host_fd,
+        accepted,
+        name
+    );
+    Ok((host_fd, accepted))
+}
+
 /// 设置 fd 的 SELinux label，使 untrusted_app 能通过 SCM_RIGHTS 接收。
 ///
 /// Android MLS/MCS 会阻止 untrusted_app (带 categories) 访问 tmpfs:s0 (无 categories)。
@@ -1219,7 +1468,9 @@ fn inject_via_bootstrapper_once(
     bootstrap_ctx.allocation_base = alloc_base as u64; // 非 NULL → Phase 2
     bootstrap_ctx.allocation_size = total_alloc as u64;
     bootstrap_ctx.page_size = page_size as u64;
-    bootstrap_ctx.enable_ctrlfds = 1;
+    // 4.x 内核无 pidfd_getfd：socketpair 建了也取不出来，跳过，由
+    // establish_ctrl_via_abstract_listener 建立目标侧监听 + host 连接。
+    bootstrap_ctx.enable_ctrlfds = if pidfd_supported() { 1 } else { 0 };
     bootstrap_ctx.libc = libc_api_addr as u64;
     mem_write_value(&mem, ctx_addr, &bootstrap_ctx)?;
 
@@ -1259,12 +1510,26 @@ fn inject_via_bootstrapper_once(
     log_verbose!("agent linker: 自解析 ELF/重定位/外部符号，不调用 dlopen/dlsym");
     log_verbose!("loader thread: raw clone，不调用 libc pthread");
 
-    // 提取 ctrlfds[0] 到 host
-    let host_ctrl_fd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
+    // 提取 ctrlfds[0] 到 host；4.x 内核走目标侧监听 + host 连接的回退通道
+    let (host_ctrl_fd, target_ctrlfd) = if pidfd_supported() {
+        let hfd = extract_fd_from_target(pid, bootstrap_ctx.ctrlfds[0])?;
+        (hfd, bootstrap_ctx.ctrlfds[1])
+    } else {
+        log_info!("pidfd_getfd 不可用（4.x 内核），启用目标侧监听回退通道");
+        establish_ctrl_via_abstract_listener(
+            trace_tid,
+            pid,
+            &mem,
+            data_base,
+            data_size,
+            &libc_api,
+            bootstrap_ctx.fallback_libc,
+        )?
+    };
     log_verbose!(
-        "已提取 ctrl fd: target {} → host {}",
-        bootstrap_ctx.ctrlfds[0],
-        host_ctrl_fd
+        "ctrl 通道: host fd={}, target fd={}",
+        host_ctrl_fd,
+        target_ctrlfd
     );
 
     // === 写入 StringTable ===
@@ -1302,7 +1567,12 @@ fn inject_via_bootstrapper_once(
 
     // 构造 LoaderContext
     let mut loader_ctx = RustFridaLoaderContext::default();
-    loader_ctx.ctrlfds = bootstrap_ctx.ctrlfds;
+    if pidfd_supported() {
+        loader_ctx.ctrlfds = bootstrap_ctx.ctrlfds;
+    } else {
+        // 回退通道：loader 只用 [1]（目标侧 accept 到的连接 fd）
+        loader_ctx.ctrlfds = [-1, target_ctrlfd];
+    }
     loader_ctx.agent_entrypoint = str_base as u64;
     loader_ctx.agent_data = data_str_addr as u64;
     loader_ctx.fallback_address = fallback_str_addr as u64;
