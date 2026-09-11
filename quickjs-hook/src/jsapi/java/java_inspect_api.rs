@@ -156,7 +156,7 @@ pub(super) unsafe extern "C" fn js_java_inspect_art_method(
     );
     set_js_u64_property(ctx, consts, "kAccSkipAccessChecks", K_ACC_SKIP_ACCESS_CHECKS as u64);
     set_js_u64_property(ctx, consts, "kAccFastNative", K_ACC_FAST_NATIVE as u64);
-    set_js_u64_property(ctx, consts, "kAccCriticalNative", K_ACC_CRITICAL_NATIVE as u64);
+    set_js_u64_property(ctx, consts, "kAccCriticalNative", k_acc_critical_native() as u64);
     JSValue(result).set_property(ctx, "consts", JSValue(consts));
 
     result

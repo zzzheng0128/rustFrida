@@ -34,8 +34,8 @@ pub(crate) fn set_reg(pid: i32, regs: &mut UserRegs) -> Result<()> {
     };
 
     let ret = gum_libc_ptrace(libc::PTRACE_SETREGSET, pid, 1, &mut iov as *const _ as usize);
-    if ret == -1 {
-        return Err(format!("设置寄存器失败: {}", std::io::Error::last_os_error()));
+    if ret < 0 {
+        return Err(format!("设置寄存器失败，错误码: {}", -ret));
     }
     Ok(())
 }
@@ -46,9 +46,16 @@ pub(crate) fn attach_to_thread(thread_id: i32) -> Result<()> {
             let mut status: usize = 0;
             let wait_result = gum_libc_waitpid(thread_id, &mut status as *mut _ as usize, 0x40000000);
             if wait_result < 0 {
+                // PTRACE_ATTACH succeeded, so do not leave a tracee stopped
+                // and attached when the wait itself fails.
+                let _ = gum_libc_ptrace(libc::PTRACE_DETACH, thread_id, 0, 0);
                 return Err("waitpid failed!!!!".to_string() + &(-wait_result).to_string());
             }
-            if !(status & 0xff) == 0x7f {
+            // waitpid status low seven bits are 0x7f for a ptrace stop.
+            // The previous `!(status & 0xff) == 0x7f` compared a bitwise
+            // complement and rejected every normal stop status.
+            if (status & 0x7f) != 0x7f {
+                let _ = gum_libc_ptrace(libc::PTRACE_DETACH, thread_id, 0, 0);
                 return Err("attach failed to stop !!!".to_string());
             }
             Ok(())

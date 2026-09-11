@@ -78,6 +78,11 @@ fn main() {
         .opt_level(2)
         .flag("-fPIC")
         .flag("-fno-exceptions")
+        // hook_engine_art.c 用了 __thread（reentry guard / ART router ctx）。
+        // rustfrida 的自定义 loader 不支持 ELF TLSDESC 重定位（R_AARCH64_TLSDESC=1031），
+        // 用 emulated TLS（__emutls_get_address）代替 —— 该符号由 rustfrida 二进制
+        // 链接的 compiler-rt builtins 提供，loader 解析时可从宿主进程拿到。
+        .flag("-femulated-tls")
         .warnings(false)
         .compile("hook_engine");
 

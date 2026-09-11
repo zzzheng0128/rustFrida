@@ -25,6 +25,20 @@ pub(crate) const LOAD_PRE_RESUME_JAVA_TIMEOUT_SECS: u64 = 30;
 pub(crate) const JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS: u64 = 35;
 pub(crate) const JAVA_STEALTH_TIMEOUT_SECS: u64 = 1;
 pub(crate) const JSCLEAN_SOFT_TIMEOUT_SECS: u64 = 1;
+const JAVA_READY_FLUSH_TIMEOUT_SECS: u64 = 5;
+// Worker startup is dispatched to a background host thread, so a short
+// settling delay does not hold up spawn/REPL.  It gives the app's main Looper
+// time to exist before the raw-clone executor receives the worker task.
+// Older/newer ART builds can override this with
+// RF_POST_RESUME_JAVA_WORKER_DELAY_MS.
+const POST_RESUME_JAVA_WORKER_DELAY_MS: u64 = 2_000;
+
+fn post_resume_java_worker_delay_ms() -> u64 {
+    std::env::var("RF_POST_RESUME_JAVA_WORKER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(POST_RESUME_JAVA_WORKER_DELAY_MS)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PostResumeJavaWorkerMode {
@@ -86,13 +100,17 @@ fn parse_loadjs_payload_for_host(payload: &str) -> (&str, &str) {
     (filename, &payload[script_start..])
 }
 
-pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> {
+fn start_java_worker_ready_blocking(session: &Session) -> Result<(), String> {
     if session.java_worker_ready.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
     let sender = session.get_sender().ok_or("agent 未连接")?;
     session.eval_state.clear();
     crate::process::thaw_cgroup_freezer(session.pid.load(std::sync::atomic::Ordering::Acquire));
+    // Keep worker installation on the raw-clone executor path.  The short
+    // post-resume delay lets the app create its main Looper before this task
+    // is enqueued; direct JNI setup from the communication thread can expose
+    // an invalid NewDirectByteBuffer context on Pixel 6/ART 35.
     send_command(sender, "javaworker_init").map_err(|e| format!("发送 Java worker 初始化失败: {}", e))?;
     match session
         .eval_state
@@ -109,6 +127,57 @@ pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> 
             "等待 Java worker 初始化超时({}s)",
             JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS
         )),
+    }
+}
+
+pub(crate) fn ensure_java_worker_ready(session: &Session) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+
+    if session.shutdown_requested.load(Ordering::Acquire) {
+        return Err("session 正在关闭，跳过 Java worker 初始化".to_string());
+    }
+    if session.java_worker_ready.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
+    // One caller owns the actual init command. A Java command typed just
+    // after spawn waits for the background task instead of creating a second
+    // dynamic worker while ART is still attaching the first one.
+    if session
+        .java_worker_starting
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let result = start_java_worker_ready_blocking(session);
+        session.java_worker_starting.store(false, Ordering::Release);
+        return result;
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS);
+    loop {
+        if session.shutdown_requested.load(Ordering::Acquire) {
+            return Err("session 正在关闭，停止等待 Java worker 初始化".to_string());
+        }
+        if session.java_worker_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if !session.java_worker_starting.load(Ordering::Acquire)
+            && session
+                .java_worker_starting
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let result = start_java_worker_ready_blocking(session);
+            session.java_worker_starting.store(false, Ordering::Release);
+            return result;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "等待正在进行的 Java worker 初始化超时({}s)",
+                JAVA_EXECUTOR_BOOTSTRAP_TIMEOUT_SECS
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -130,6 +199,85 @@ pub(crate) fn ensure_java_worker_ready_after_resume(session: &Session, java_work
     run_post_resume_java_worker_mode(session, PostResumeJavaWorkerMode::from_env()?, java_worker_needed)
 }
 
+/// Schedule post-resume Java setup without holding up the spawn path.  ART's
+/// managed thread may need a few seconds to become attachable on Pixel 6;
+/// keeping this wait off the main host thread lets the target resume and lets
+/// the REPL show output immediately.  The worker itself is still serialized
+/// and Java.ready callbacks are flushed after it is ready.
+pub(crate) fn schedule_java_worker_ready_after_resume(session: Arc<Session>, java_worker_needed: bool) {
+    use std::sync::atomic::Ordering;
+
+    if !java_worker_needed
+        || session.shutdown_requested.load(Ordering::Acquire)
+        || session.java_worker_ready.load(Ordering::Acquire)
+        || session
+            .java_worker_setup_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    let worker_session = session.clone();
+    let scheduled = std::thread::Builder::new()
+        .name("rf-java-resume".to_string())
+        .spawn(move || {
+            if worker_session.shutdown_requested.load(Ordering::Acquire) {
+                worker_session
+                    .java_worker_setup_scheduled
+                    .store(false, Ordering::Release);
+                return;
+            }
+            if let Err(e) = ensure_java_worker_ready_after_resume(&worker_session, true) {
+                log_warn!("Java worker 异步启动失败，依赖 worker 的后续 Java 操作暂不可用: {}", e);
+            }
+            worker_session
+                .java_worker_setup_scheduled
+                .store(false, Ordering::Release);
+        });
+    if scheduled.is_err() {
+        session.java_worker_setup_scheduled.store(false, Ordering::Release);
+        log_warn!("无法创建 Java worker 后台启动线程");
+    }
+}
+
+/// Spawn 的 pre-resume 脚本可能在 `Instrumentation.newApplication` 之后才装好
+/// Java.ready gate。此时回调队列已经注册，但不会再收到 framework gate 事件。
+/// Java worker 就绪后在受管线程上重新探测 ClassLoader，并主动冲刷队列，覆盖
+/// Pixel/Android 版本之间的启动时序差异。
+fn flush_java_ready_callbacks_after_resume(session: &Session) -> Result<(), String> {
+    let sender = session.get_sender().ok_or("agent 未连接")?;
+    for attempt in 0..3 {
+        session.eval_state.clear();
+        // This command only queues work on an already-running managed worker.
+        // Keeping lazy startup out of the recovery path prevents a missed
+        // startup gate from creating another dynamic dex worker class.
+        send_command(sender, "java_ready_flush").map_err(|e| format!("发送 Java.ready 补偿探测失败: {}", e))?;
+        match session
+            .eval_state
+            .recv_timeout(std::time::Duration::from_secs(JAVA_READY_FLUSH_TIMEOUT_SECS))
+        {
+            Some(Ok(result)) if result.trim() == "true" => return Ok(()),
+            Some(Ok(result)) => {
+                if attempt == 2 {
+                    log_warn!("Java.ready 补偿探测未就绪: {}", result.trim());
+                }
+            }
+            Some(Err(error)) => {
+                if attempt == 2 {
+                    log_warn!("Java.ready 补偿冲刷失败: {}", error);
+                }
+            }
+            None => {
+                if attempt == 2 {
+                    log_warn!("Java.ready 补偿探测超时");
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
 pub(crate) fn run_post_resume_java_worker_mode(
     session: &Session,
     mode: PostResumeJavaWorkerMode,
@@ -145,7 +293,9 @@ pub(crate) fn run_post_resume_java_worker_mode(
                 return Ok(());
             }
             log_info!("spawn 已恢复，检测到 Java 操作，启动 Java worker");
-            ensure_java_worker_ready(session)
+            std::thread::sleep(std::time::Duration::from_millis(post_resume_java_worker_delay_ms()));
+            ensure_java_worker_ready(session)?;
+            flush_java_ready_callbacks_after_resume(session)
         }
         PostResumeJavaWorkerMode::Skip => {
             log_warn!("RF_POST_RESUME_JAVA_WORKER_MODE=skip，跳过 spawn 恢复后的 Java worker 启动");
@@ -156,7 +306,9 @@ pub(crate) fn run_post_resume_java_worker_mode(
                 return Ok(());
             }
             log_info!("spawn 已恢复，启动 Java worker 作为后续 Java 操作执行线程");
-            ensure_java_worker_ready(session)
+            std::thread::sleep(std::time::Duration::from_millis(post_resume_java_worker_delay_ms()));
+            ensure_java_worker_ready(session)?;
+            flush_java_ready_callbacks_after_resume(session)
         }
     }
 }
@@ -706,7 +858,7 @@ fn load_script_file_with_mode(
                 Some(Err(e)) => return Err(format!("pre-resume Java 脚本执行失败: {}", e)),
                 Some(Ok(out)) => {
                     if !out.is_empty() {
-                        println!("{GREEN}=> {out}{RESET}");
+                        crate::logger::agent_line(session.id, &format!("{GREEN}=> {out}{RESET}"), &format!("=> {out}"));
                     }
                     cut_pre_resume_java_executor_hook(session)?;
                     return Ok(PreResumeLoad::DeferredEvalCompleted);
@@ -748,15 +900,21 @@ pub(crate) fn print_eval_result(session: &Session, timeout_secs: u64) {
         ),
         Some(Ok(output)) => {
             if let Some(err) = output.strip_prefix(JSEVAL_ERROR_PREFIX) {
-                crate::logger::stdout_line(
+                crate::logger::agent_line(
+                    session.id,
                     &format!("{RED}[JS error] {}{RESET}", err),
                     &format!("[JS error] {}", err),
                 );
             } else if !output.is_empty() {
-                crate::logger::stdout_line(&format!("{GREEN}=> {}{RESET}", output), &format!("=> {}", output));
+                crate::logger::agent_line(
+                    session.id,
+                    &format!("{GREEN}=> {}{RESET}", output),
+                    &format!("=> {}", output),
+                );
             }
         }
-        Some(Err(err)) => crate::logger::stdout_line(
+        Some(Err(err)) => crate::logger::agent_line(
+            session.id,
             &format!("{RED}[JS error] {}{RESET}", err),
             &format!("[JS error] {}", err),
         ),
@@ -766,54 +924,54 @@ pub(crate) fn print_eval_result(session: &Session, timeout_secs: u64) {
 /// 打印命令帮助表
 pub(crate) fn print_help() {
     use crate::logger::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
-    println!("\n{BOLD}{CYAN}可用命令:{RESET}");
-    println!("{DIM}  {:<10} {:<22} {}{RESET}", "命令", "参数", "说明");
-    println!("{DIM}  {:-<10} {:-<22} {:-<20}{RESET}", "", "", "");
+    crate::console_log!("\n{BOLD}{CYAN}可用命令:{RESET}");
+    crate::console_log!("{DIM}  {:<10} {:<22} {}{RESET}", "命令", "参数", "说明");
+    crate::console_log!("{DIM}  {:-<10} {:-<22} {:-<20}{RESET}", "", "", "");
     for (cmd, args, desc) in commands() {
-        println!("  {BOLD}{GREEN}{:<10}{RESET} {YELLOW}{:<22}{RESET} {}", cmd, args, desc);
+        crate::console_log!("  {BOLD}{GREEN}{:<10}{RESET} {YELLOW}{:<22}{RESET} {}", cmd, args, desc);
     }
-    println!();
-    println!("{BOLD}{CYAN}JavaScript API（在 loadjs/jseval/jsrepl 中可用）:{RESET}");
-    println!("{DIM}  console{RESET}      log/info/warn/error/debug");
-    println!("{DIM}  ptr(addr){RESET}    创建指针对象，addr 为数字或十六进制字符串");
-    println!("{DIM}  Memory{RESET}       .readU8/16/32/64(ptr)  → number");
-    println!("{DIM}             {RESET}  .readPointer(ptr)      → ptr");
-    println!("{DIM}             {RESET}  .readCString(ptr)      → string（最多 4096 字节）");
-    println!("{DIM}             {RESET}  .readByteArray(ptr, n) → ArrayBuffer");
-    println!("{DIM}             {RESET}  .writeU8/16/32/64(ptr, val)");
-    println!("{DIM}             {RESET}  .writePointer(ptr, val)");
-    println!("{DIM}             {RESET}  无效地址抛 RangeError，不会 crash");
-    println!("{DIM}  hook{RESET}         hook(target_ptr, replacement_ptr[, retval])");
-    println!("{DIM}             {RESET}  replacement_ptr 为 JS 函数或 NativePointer");
-    println!("{DIM}  unhook{RESET}       unhook(target_ptr)");
-    println!("{DIM}  callNative{RESET}   callNative(addr, retType, argTypes, ...args)");
-    println!("{DIM}             {RESET}  retType/argType: 'void'|'int'|'long'|'ptr'|'float'");
-    println!("{DIM}  Module{RESET}       .findExportByName/.findBaseAddress/.findByAddress");
-    println!("{DIM}             {RESET}  .enumerateModules() → Array<{{name,base,size,path}}>");
-    println!("{DIM}  Java{RESET}         .use(class) → class wrapper (Proxy)");
-    println!("{DIM}             {RESET}  .$new(...args) → new Java object");
-    println!("{DIM}             {RESET}  .method.impl = fn → hook (auto-detect overload)");
-    println!("{DIM}             {RESET}  .method.overload(sig).impl = fn");
-    println!("{DIM}             {RESET}  .method.impl = null → unhook");
-    println!("{DIM}  Jni{RESET}          .FindClass/.RegisterNatives ... → JNI 函数地址");
-    println!("{DIM}             {RESET}  .addr(env, \"FindClass\") / .addr(\"FindClass\")");
-    println!("{DIM}             {RESET}  .find(env, \"FindClass\") / .entries(env) / .table.FindClass");
-    println!("{DIM}             {RESET}  .helper.env.getObjectClassName(obj)");
-    println!("{DIM}             {RESET}  .helper.structs.JNINativeMethod.readArray(ptr, n)");
-    println!("{DIM}             {RESET}  .helper.structs.jvalue.readArray(ptr, \"(ILjava/lang/String;)V\")");
-    println!("{DIM}  示例:{RESET}");
-    println!("{DIM}    jseval Memory.readCString(ptr(0x7f000000)){RESET}");
-    println!("{DIM}    jseval JSON.stringify(Module.findByAddress(ptr(0x7f000000))){RESET}");
-    println!("{DIM}    loadjs hook(ptr(0x1234), function(ctx){{console.log('hit')}}){RESET}");
-    println!("{DIM}    loadjs var A=Java.use(\"android.app.Activity\"); A.onResume.impl=function(ctx){{console.log('hit')}}{RESET}");
-    println!("{DIM}    loadjs hook(Jni.addr(\"FindClass\"), function(ctx){{console.log(Memory.readCString(ptr(ctx.x1))); return ctx.orig()}}){RESET}");
-    println!("{DIM}    loadjs hook(Jni.addr(\"RegisterNatives\"), function(ctx){{console.log(JSON.stringify(Jni.structs.JNINativeMethod.readArray(ptr(ctx.x2), Number(ctx.x3)))); return ctx.orig()}}){RESET}");
-    println!("{DIM}    loadjs hook(Jni.addr(\"GetMethodID\"), function(ctx){{console.log(Jni.env.getClassName(ctx.x1), Memory.readCString(ptr(ctx.x2)), Memory.readCString(ptr(ctx.x3))); return ctx.orig()}}){RESET}");
-    println!("{DIM}    loadjs var P=Java.use(\"android.os.Process\"); console.log(P.myPid()){RESET}");
-    println!(
+    crate::console_log!();
+    crate::console_log!("{BOLD}{CYAN}JavaScript API（在 loadjs/jseval/jsrepl 中可用）:{RESET}");
+    crate::console_log!("{DIM}  console{RESET}      log/info/warn/error/debug");
+    crate::console_log!("{DIM}  ptr(addr){RESET}    创建指针对象，addr 为数字或十六进制字符串");
+    crate::console_log!("{DIM}  Memory{RESET}       .readU8/16/32/64(ptr)  → number");
+    crate::console_log!("{DIM}             {RESET}  .readPointer(ptr)      → ptr");
+    crate::console_log!("{DIM}             {RESET}  .readCString(ptr)      → string（最多 4096 字节）");
+    crate::console_log!("{DIM}             {RESET}  .readByteArray(ptr, n) → ArrayBuffer");
+    crate::console_log!("{DIM}             {RESET}  .writeU8/16/32/64(ptr, val)");
+    crate::console_log!("{DIM}             {RESET}  .writePointer(ptr, val)");
+    crate::console_log!("{DIM}             {RESET}  无效地址抛 RangeError，不会 crash");
+    crate::console_log!("{DIM}  hook{RESET}         hook(target_ptr, replacement_ptr[, retval])");
+    crate::console_log!("{DIM}             {RESET}  replacement_ptr 为 JS 函数或 NativePointer");
+    crate::console_log!("{DIM}  unhook{RESET}       unhook(target_ptr)");
+    crate::console_log!("{DIM}  callNative{RESET}   callNative(addr, retType, argTypes, ...args)");
+    crate::console_log!("{DIM}             {RESET}  retType/argType: 'void'|'int'|'long'|'ptr'|'float'");
+    crate::console_log!("{DIM}  Module{RESET}       .findExportByName/.findBaseAddress/.findByAddress");
+    crate::console_log!("{DIM}             {RESET}  .enumerateModules() → Array<{{name,base,size,path}}>");
+    crate::console_log!("{DIM}  Java{RESET}         .use(class) → class wrapper (Proxy)");
+    crate::console_log!("{DIM}             {RESET}  .$new(...args) → new Java object");
+    crate::console_log!("{DIM}             {RESET}  .method.impl = fn → hook (auto-detect overload)");
+    crate::console_log!("{DIM}             {RESET}  .method.overload(sig).impl = fn");
+    crate::console_log!("{DIM}             {RESET}  .method.impl = null → unhook");
+    crate::console_log!("{DIM}  Jni{RESET}          .FindClass/.RegisterNatives ... → JNI 函数地址");
+    crate::console_log!("{DIM}             {RESET}  .addr(env, \"FindClass\") / .addr(\"FindClass\")");
+    crate::console_log!("{DIM}             {RESET}  .find(env, \"FindClass\") / .entries(env) / .table.FindClass");
+    crate::console_log!("{DIM}             {RESET}  .helper.env.getObjectClassName(obj)");
+    crate::console_log!("{DIM}             {RESET}  .helper.structs.JNINativeMethod.readArray(ptr, n)");
+    crate::console_log!("{DIM}             {RESET}  .helper.structs.jvalue.readArray(ptr, \"(ILjava/lang/String;)V\")");
+    crate::console_log!("{DIM}  示例:{RESET}");
+    crate::console_log!("{DIM}    jseval Memory.readCString(ptr(0x7f000000)){RESET}");
+    crate::console_log!("{DIM}    jseval JSON.stringify(Module.findByAddress(ptr(0x7f000000))){RESET}");
+    crate::console_log!("{DIM}    loadjs hook(ptr(0x1234), function(ctx){{console.log('hit')}}){RESET}");
+    crate::console_log!("{DIM}    loadjs var A=Java.use(\"android.app.Activity\"); A.onResume.impl=function(ctx){{console.log('hit')}}{RESET}");
+    crate::console_log!("{DIM}    loadjs hook(Jni.addr(\"FindClass\"), function(ctx){{console.log(Memory.readCString(ptr(ctx.x1))); return ctx.orig()}}){RESET}");
+    crate::console_log!("{DIM}    loadjs hook(Jni.addr(\"RegisterNatives\"), function(ctx){{console.log(JSON.stringify(Jni.structs.JNINativeMethod.readArray(ptr(ctx.x2), Number(ctx.x3)))); return ctx.orig()}}){RESET}");
+    crate::console_log!("{DIM}    loadjs hook(Jni.addr(\"GetMethodID\"), function(ctx){{console.log(Jni.env.getClassName(ctx.x1), Memory.readCString(ptr(ctx.x2)), Memory.readCString(ptr(ctx.x3))); return ctx.orig()}}){RESET}");
+    crate::console_log!("{DIM}    loadjs var P=Java.use(\"android.os.Process\"); console.log(P.myPid()){RESET}");
+    crate::console_log!(
         "{DIM}    loadjs var S=Java.use(\"java.lang.String\"); var s=S.$new(\"hello\"); console.log(s.length()){RESET}"
     );
-    println!();
+    crate::console_log!();
 }
 
 /// Enter an interactive JS REPL mode.
@@ -855,7 +1013,7 @@ pub(crate) fn run_js_repl(session: &Arc<Session>) {
         }
     }
 
-    println!("\n{BOLD}{CYAN}进入 JS REPL 模式{RESET} {DIM}(输入 exit 或按 Ctrl-D 退出){RESET}\n");
+    crate::console_log!("\n{BOLD}{CYAN}进入 JS REPL 模式{RESET} {DIM}(输入 exit 或按 Ctrl-D 退出){RESET}\n");
 
     let config = Config::builder().completion_type(CompletionType::Circular).build();
     let mut rl: Editor<JsReplCompleter, _> = match Editor::with_config(config) {
@@ -877,7 +1035,7 @@ pub(crate) fn run_js_repl(session: &Arc<Session>) {
                 }
                 let _ = rl.add_history_entry(&line);
                 if line == "exit" || line == "quit" {
-                    println!("{DIM}退出 JS REPL 模式{RESET}");
+                    crate::console_log!("{DIM}退出 JS REPL 模式{RESET}");
                     break;
                 }
                 // 发送前清空 eval 状态
@@ -899,7 +1057,7 @@ pub(crate) fn run_js_repl(session: &Arc<Session>) {
                 print_eval_result(session, EVAL_DEFAULT_TIMEOUT_SECS);
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
-                println!("{DIM}退出 JS REPL 模式{RESET}");
+                crate::console_log!("{DIM}退出 JS REPL 模式{RESET}");
                 break;
             }
             Err(e) => {

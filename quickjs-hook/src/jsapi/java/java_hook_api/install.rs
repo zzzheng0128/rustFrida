@@ -322,7 +322,11 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     let return_type_sig = get_return_type_sig(&actual_sig);
     let param_count = count_jni_params(&actual_sig);
     let param_types = parse_jni_param_types(&actual_sig);
-    let has_critical_native_flag = (original_access_flags & K_ACC_CRITICAL_NATIVE) != 0;
+    // The CriticalNative bit moved in Android 12. Resolve it from the
+    // running ART version instead of treating the legacy bit as active on
+    // modern devices (Pixel 6/Android 15 would otherwise get the wrong JNI
+    // ABI and corrupt the caller's JIT state).
+    let has_critical_native_flag = (original_access_flags & k_acc_critical_native()) != 0;
     let critical_native_signature_supported =
         is_critical_native_signature_supported(is_static, &return_type_sig, &param_types);
     let is_critical_native = has_critical_native_flag && critical_native_signature_supported;

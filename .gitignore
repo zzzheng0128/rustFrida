@@ -11,4 +11,49 @@ tools/
 CLAUDE.md
 scripts/
 target*/
-stress*/
+stress*
+rustfrida_target/
+runs/
+out/
+log/
+
+# 构建、运行和调试产生的本地文件，不上传到仓库
+*.apk
+*.aab
+*.dex
+*.class
+*.jsonl
+*.log
+*.o
+*.obj
+*.pyc
+__pycache__/
+.DS_Store
+
+# Android/Gradle 和本地实验生成物
+**/.gradle/
+**/.cxx/
+*.apk
+*.aab
+*.dex
+*.class
+
+# 本地日志、事件流和编译中间文件
+*.log
+*.jsonl
+*.o
+*.obj
+*.pyc
+__pycache__/
+.DS_Store
+
+# 这些是新手入口和可复用模板说明，应随模板一起保留。
+!DOCS.md
+!SCRIPT_GUIDE.md
+!使用文档.md
+!examples/templates/README.md
+!examples/rustfrida-compat-app/README.md
+examples/rustfrida-compat-app/.gradle/
+examples/rustfrida-compat-app/app/build/
+examples/rustfrida-compat-app/app/.cxx/
+examples/rustfrida-compat-app/app/src/main/assets/payload.dex

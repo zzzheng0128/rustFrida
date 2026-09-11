@@ -308,13 +308,30 @@ const EXECUTOR_NO_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from
 const EXECUTOR_LIGHT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
 const EXECUTOR_DRAIN_LIMIT: usize = 32;
 
+fn executor_shutdown_error(stage: &str, kind: &ExecutorTaskKind) -> String {
+    // Diagnostic-only independent atomic reads, not a coherent state transaction.
+    // Call after releasing the queue lock; never include task arguments or addresses.
+    let aborting = EXECUTOR_ABORTING.load(std::sync::atomic::Ordering::Acquire);
+    let draining = EXECUTOR_DRAINING.load(std::sync::atomic::Ordering::Acquire);
+    let loop_hook_present = EXECUTOR_LOOP_HOOK_TARGET.load(std::sync::atomic::Ordering::Acquire) != 0;
+    let handler_hook_present = EXECUTOR_HANDLER_HOOK_TARGET.load(std::sync::atomic::Ordering::Acquire) != 0;
+    let task = if matches!(kind, ExecutorTaskKind::StartJavaWorker { .. }) {
+        "start_worker"
+    } else {
+        "other"
+    };
+    format!(
+        "Java executor is shutting down [stage={stage} task={task} aborting={aborting} draining={draining} loop_hook_present={loop_hook_present} handler_hook_present={handler_hook_present}]"
+    )
+}
+
 unsafe fn enqueue_executor_task(
     kind: ExecutorTaskKind,
     param_types: Vec<String>,
     args: Vec<ExecutorArg>,
 ) -> ExecutorResult {
     if EXECUTOR_ABORTING.load(std::sync::atomic::Ordering::Acquire) {
-        return Err("Java executor is shutting down".to_string());
+        return Err(executor_shutdown_error("enqueue_entry", &kind));
     }
 
     let wait_timeout = executor_wait_timeout(&kind);
@@ -325,9 +342,8 @@ unsafe fn enqueue_executor_task(
         result: std::sync::Mutex::new(None),
     });
 
-    {
-        let mut queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        queue.push_back(req.clone());
+    if !try_queue_executor_task(&req) {
+        return Err(executor_shutdown_error("enqueue_commit", &req.kind));
     }
 
     let mut last_wake = std::time::Instant::now();
@@ -336,10 +352,23 @@ unsafe fn enqueue_executor_task(
     let start = std::time::Instant::now();
     loop {
         if let Some(result) = req.result.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            // On Pixel/ART builds the nativePollOnce inline hook is safe as a
+            // short-lived wakeup mechanism but unstable when left installed
+            // during normal JIT startup.  Wait until the callback has fully
+            // returned, then drop it while no work is queued.  The next
+            // request will install it again through ensure_executor_loop_ready.
+            if crate::is_raw_clone_js_thread()
+                && EXECUTOR_HANDLER_HOOK_TARGET.load(std::sync::atomic::Ordering::Acquire) == 0
+            {
+                wait_for_executor_drain_idle();
+                if !executor_queue_has_pending() {
+                    let _ = cut_message_queue_executor_hook();
+                }
+            }
             return result;
         }
         if EXECUTOR_ABORTING.load(std::sync::atomic::Ordering::Acquire) && cancel_executor_task(&req) {
-            return Err("Java executor is shutting down".to_string());
+            return Err(executor_shutdown_error("wait_cancel", &req.kind));
         }
         let last_message_queue = selected_executor_message_queue();
         if !crate::is_raw_clone_js_thread()
@@ -411,6 +440,19 @@ fn executor_wait_timeout(kind: &ExecutorTaskKind) -> std::time::Duration {
 fn executor_queue_has_pending() -> bool {
     let queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     !queue.is_empty()
+}
+
+fn wait_for_executor_drain_idle() {
+    let start = std::time::Instant::now();
+    while EXECUTOR_DRAINING.load(std::sync::atomic::Ordering::Acquire) {
+        if start.elapsed() >= std::time::Duration::from_millis(100) {
+            crate::jsapi::console::output_verbose(
+                "[java executor] drain callback did not become idle before hook-cut deadline",
+            );
+            break;
+        }
+        raw_executor_sleep_1ms();
+    }
 }
 
 fn wake_executor_drain_trigger() -> bool {
@@ -673,11 +715,17 @@ fn log_invalid_message_queue(queue_ptr: u64, where_: &str) {
     }
 }
 
+#[inline]
+fn untag_ptr(ptr: u64) -> u64 {
+    ptr & super::PAC_STRIP_MASK
+}
+
 fn is_valid_native_message_queue(queue_ptr: u64) -> bool {
+    let queue_ptr = untag_ptr(queue_ptr);
     if queue_ptr < 0x10000 || !crate::jsapi::util::is_addr_accessible(queue_ptr, 16) {
         return false;
     }
-    let looper = unsafe { std::ptr::read_volatile(queue_ptr as *const u64) };
+    let looper = untag_ptr(unsafe { std::ptr::read_volatile(queue_ptr as *const u64) });
     if looper < 0x10000 || !crate::jsapi::util::is_addr_accessible(looper, 8) {
         return false;
     }
@@ -693,6 +741,7 @@ fn is_valid_native_message_queue(queue_ptr: u64) -> bool {
 }
 
 fn safe_write_looper_wake_fd(queue_ptr: u64) -> Option<bool> {
+    let queue_ptr = untag_ptr(queue_ptr);
     let fd_offset = looper_wake_fd_offset();
     if fd_offset == 0 {
         return None;
@@ -700,7 +749,7 @@ fn safe_write_looper_wake_fd(queue_ptr: u64) -> Option<bool> {
     if queue_ptr < 0x10000 || !crate::jsapi::util::is_addr_accessible(queue_ptr, 8) {
         return Some(false);
     }
-    let looper = unsafe { std::ptr::read_volatile(queue_ptr as *const u64) };
+    let looper = untag_ptr(unsafe { std::ptr::read_volatile(queue_ptr as *const u64) });
     if looper < 0x10000 || !crate::jsapi::util::is_addr_accessible(looper + fd_offset as u64, 4) {
         return Some(false);
     }
@@ -769,6 +818,34 @@ unsafe fn resolve_looper_wake_fd_offset() -> Option<u32> {
     None
 }
 
+// Admission, shutdown and dequeue share the queue lock. The early check in
+// enqueue_executor_task is only an allocation-saving fast path: shutdown may
+// start after that check, so admission must check again while holding the lock.
+fn try_queue_executor_task(req: &std::sync::Arc<ExecutorRequest>) -> bool {
+    let mut queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if EXECUTOR_ABORTING.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    queue.push_back(req.clone());
+    true
+}
+
+fn pop_executor_task() -> Option<std::sync::Arc<ExecutorRequest>> {
+    let mut queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if EXECUTOR_ABORTING.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    queue.pop_front()
+}
+
+fn take_executor_tasks_for_abort() -> Vec<std::sync::Arc<ExecutorRequest>> {
+    // Only queued requests are cancelled here. A request already returned by
+    // pop_executor_task is in flight; closing admission does not finish it.
+    let mut queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    EXECUTOR_ABORTING.store(true, std::sync::atomic::Ordering::Release);
+    queue.drain(..).collect()
+}
+
 fn cancel_executor_task(req: &std::sync::Arc<ExecutorRequest>) -> bool {
     let mut queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let before = queue.len();
@@ -782,15 +859,12 @@ fn complete_executor_task(req: &ExecutorRequest, result: ExecutorResult) {
 }
 
 pub(crate) fn reset_raw_clone_executor_abort() {
+    let _queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     EXECUTOR_ABORTING.store(false, std::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn abort_raw_clone_executor_for_unload() {
-    EXECUTOR_ABORTING.store(true, std::sync::atomic::Ordering::Release);
-    let pending = {
-        let mut queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-        queue.drain(..).collect::<Vec<_>>()
-    };
+    let pending = take_executor_tasks_for_abort();
     if !pending.is_empty() {
         crate::jsapi::console::output_verbose(&format!(
             "[java executor] aborting {} pending task(s) for unload",
@@ -798,7 +872,8 @@ pub(crate) fn abort_raw_clone_executor_for_unload() {
         ));
     }
     for req in pending {
-        complete_executor_task(&req, Err("Java executor is shutting down".to_string()));
+        let error = executor_shutdown_error("abort_pending", &req.kind);
+        complete_executor_task(&req, Err(error));
     }
     wake_executor_message_queue();
 }
@@ -846,10 +921,7 @@ pub(crate) unsafe fn drain_raw_clone_executor(env: JniEnv) -> usize {
         if count >= EXECUTOR_DRAIN_LIMIT {
             break;
         }
-        let req = {
-            let mut queue = EXECUTOR_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-            queue.pop_front()
-        };
+        let req = pop_executor_task();
         let Some(req) = req else {
             break;
         };
@@ -861,10 +933,15 @@ pub(crate) unsafe fn drain_raw_clone_executor(env: JniEnv) -> usize {
 }
 
 pub(crate) unsafe fn install_raw_clone_executor_loop_hook(env: JniEnv) -> bool {
+    // ABORTING 闩锁必须在"复用已装触发器"的早退路径之前清零:
+    // unload 置位 ABORTING 后,若 loop hook 未拆(或 hook_remove 失败),
+    // 重装/复用路径会跳过 reset,此后所有 enqueue 永远走 enqueue_entry 失败,
+    // 表现即 "Java executor is shutting down [stage=enqueue_entry ...]"。
+    // install 只在新 worker/engine 生命周期起点调用,语义即"重新准入",清零安全。
+    reset_raw_clone_executor_abort();
     if executor_drain_trigger_installed() {
         return true;
     }
-    reset_raw_clone_executor_abort();
     if env.is_null() {
         crate::jsapi::console::output_verbose(
             "[java executor] installing Java-thread executor hooks without JNIEnv (symbol/self-parse)",
@@ -872,7 +949,12 @@ pub(crate) unsafe fn install_raw_clone_executor_loop_hook(env: JniEnv) -> bool {
     }
 
     let mut installed = install_message_queue_executor_hook(env);
-    if !env.is_null() {
+    // Handler.dispatchMessage remains an opt-in diagnostic fallback.  On
+    // Pixel 6/ART 35, installing a second managed-entry hook during startup
+    // is less predictable than the short-lived MessageQueue trigger.
+    if !env.is_null()
+        && std::env::var("KT_JAVA_EXECUTOR_HANDLER").ok().as_deref() == Some("1")
+    {
         installed |= install_handler_dispatch_executor_hook(env);
     }
     installed
@@ -885,16 +967,18 @@ pub(crate) unsafe fn start_java_worker_thread_via_executor(native_loop: *mut std
     if !ensure_executor_loop_ready() {
         return Err("Java executor loop hook is not installed".to_string());
     }
-    match enqueue_executor_task(
+    let result = enqueue_executor_task(
         ExecutorTaskKind::StartJavaWorker {
             native_loop: native_loop as u64,
         },
         Vec::new(),
         Vec::new(),
-    ) {
-        Ok(_) => Ok(()),
-        Err(err) => Err(err),
+    );
+    if let Err(err) = result {
+        return Err(err);
     }
+
+    Ok(())
 }
 
 unsafe fn install_message_queue_executor_hook(env: JniEnv) -> bool {
@@ -1083,7 +1167,13 @@ pub(super) unsafe fn enumerate_methods_via_executor(class_name: &str) -> Result<
 }
 
 fn ensure_executor_loop_ready() -> bool {
-    executor_drain_trigger_installed() || unsafe { install_raw_clone_executor_loop_hook(std::ptr::null_mut()) }
+    if executor_drain_trigger_installed() {
+        // 触发器还在 → 短路不经过 install,上次 unload 残留的 ABORTING 闩锁
+        // 必须在这里清掉,否则 start_worker 入队即被 enqueue_entry 拒绝。
+        reset_raw_clone_executor_abort();
+        return true;
+    }
+    unsafe { install_raw_clone_executor_loop_hook(std::ptr::null_mut()) }
 }
 
 fn executor_drain_trigger_installed() -> bool {
@@ -1200,6 +1290,37 @@ pub(crate) fn cut_raw_clone_executor_loop_hook() -> bool {
     removed_all
 }
 
+/// Remove only the bootstrap MessageQueue hook while leaving executor
+/// admission and the Handler.dispatchMessage trigger intact.
+fn cut_message_queue_executor_hook() -> bool {
+    let target = EXECUTOR_LOOP_HOOK_TARGET.load(std::sync::atomic::Ordering::Acquire);
+    if target == 0 {
+        return true;
+    }
+
+    let reverted = crate::recomp::try_revert_slot_patch_by_slot(target as usize);
+    if reverted {
+        crate::jsapi::console::output_verbose(&format!(
+            "[java executor] MessageQueue reverted recomp slot branch for target={:#x}",
+            target
+        ));
+    }
+    let ret = unsafe { hook_ffi::hook_remove(target as *mut std::ffi::c_void) };
+    if ret != 0 {
+        crate::jsapi::console::output_verbose(&format!(
+            "[java executor] MessageQueue bootstrap hook remove failed: {:#x}, ret={}",
+            target, ret
+        ));
+        return false;
+    }
+
+    EXECUTOR_LOOP_HOOK_TARGET.store(0, std::sync::atomic::Ordering::Release);
+    EXECUTOR_NATIVE_WAKE.store(0, std::sync::atomic::Ordering::Release);
+    EXECUTOR_MAIN_MESSAGE_QUEUE.store(0, std::sync::atomic::Ordering::Release);
+    EXECUTOR_LAST_MESSAGE_QUEUE.store(0, std::sync::atomic::Ordering::Release);
+    true
+}
+
 pub(crate) fn raw_clone_executor_hook_active() -> bool {
     executor_drain_trigger_installed()
 }
@@ -1245,7 +1366,9 @@ unsafe extern "C" fn on_message_queue_native_poll_once_enter(
     ctx.intercept_leave = 0;
 
     let env = ctx.x[0] as JniEnv;
-    let queue_ptr = ctx.x[2];
+    // Android MTE/TBI may tag the native MessageQueue argument (for example
+    // 0xb4xx...).  Strip the tag before caching or dereferencing it.
+    let queue_ptr = untag_ptr(ctx.x[2]);
     if queue_ptr != 0 {
         if !is_valid_native_message_queue(queue_ptr) {
             log_invalid_message_queue(queue_ptr, "poll");

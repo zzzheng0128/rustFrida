@@ -1,0 +1,113 @@
+--- a/kpms/mkpm/dysvcpit/sysmon.c
++++ b/kpms/mkpm/dysvcpit/sysmon.c
+@@ -39,6 +39,11 @@
+     char path[SYSMON_PATH_MAX];
+ };
+ 
++struct sysmon_slot {
++    volatile u32 version;
++    struct sysmon_event event;
++};
++
+ struct sysmon_hook {
+     int nr;
+     int narg;
+@@ -51,7 +56,7 @@
+     int len;
+ };
+ 
+-static struct sysmon_event g_ring[SYSMON_RING_CAP];
++static struct sysmon_slot g_ring[SYSMON_RING_CAP];
+ static struct sysmon_hook g_hooks[SYSMON_MAX_HOOKS];
+ static u64 g_next_seq;
+ static u64 g_dropped;
+@@ -125,10 +130,17 @@
+ 
+ static int reply_copy(struct sysmon_reply *r, char __user *out_msg, int outlen)
+ {
++    int copy_len;
++
+     reply_finish(r);
+     if (!out_msg || outlen <= 0)
+         return 0;
+-    return compat_copy_to_user(out_msg, r->buf, r->len + 1);
++
++    copy_len = r->len + 1;
++    if (copy_len > outlen)
++        copy_len = outlen;
++    r->buf[copy_len - 1] = '\0';
++    return compat_copy_to_user(out_msg, r->buf, copy_len);
+ }
+ 
+ static bool parse_u64(const char *text, unsigned int default_base, u64 *out)
+@@ -192,7 +204,7 @@
+     int uid_filter = g_target_uid;
+     int tgid_filter = g_target_tgid;
+     int uid = (int)current_uid();
+-    int tgid = (int)sysmon_task_pid(task);
++    int tgid = (int)sysmon_task_tgid(task);
+ 
+     if (!g_enabled)
+         return false;
+@@ -268,6 +280,8 @@
+     struct sysmon_event event;
+     struct task_struct *task = current;
+     u64 seq;
++    int slot_idx;
++    u32 version;
+     int i;
+ 
+     event.seq = 0;
+@@ -286,7 +300,13 @@
+     event.seq = seq + 1;
+     if (event.seq > SYSMON_RING_CAP)
+         __atomic_fetch_add(&g_dropped, 1, __ATOMIC_RELAXED);
+-    g_ring[event.seq % SYSMON_RING_CAP] = event;
++
++    slot_idx = event.seq % SYSMON_RING_CAP;
++    version = __atomic_load_n(&g_ring[slot_idx].version, __ATOMIC_RELAXED);
++    version = (version | 1U);
++    __atomic_store_n(&g_ring[slot_idx].version, version, __ATOMIC_RELEASE);
++    g_ring[slot_idx].event = event;
++    __atomic_store_n(&g_ring[slot_idx].version, version + 1U, __ATOMIC_RELEASE);
+ 
+     sysmon_emit_dmesg(&event);
+ }
+@@ -391,8 +411,11 @@
+ {
+     g_next_seq = 1;
+     g_dropped = 0;
+-    for (int i = 0; i < SYSMON_RING_CAP; ++i)
+-        g_ring[i].seq = 0;
++    for (int i = 0; i < SYSMON_RING_CAP; ++i) {
++        __atomic_store_n(&g_ring[i].version, 1U, __ATOMIC_RELEASE);
++        g_ring[i].event.seq = 0;
++        __atomic_store_n(&g_ring[i].version, 2U, __ATOMIC_RELEASE);
++    }
+ }
+ 
+ static int sysmon_attach_preset_io(void)
+@@ -523,9 +546,20 @@
+         seq = oldest;
+     }
+     while (seq < next_seq && count < limit) {
+-        struct sysmon_event *source = &g_ring[seq % SYSMON_RING_CAP];
+-        if (source->seq == seq)
+-            events[count++] = *source;
++        struct sysmon_slot *slot = &g_ring[seq % SYSMON_RING_CAP];
++        struct sysmon_event event;
++        u32 before;
++        u32 after;
++
++        before = __atomic_load_n(&slot->version, __ATOMIC_ACQUIRE);
++        if (before & 1U) {
++            ++seq;
++            continue;
++        }
++        event = slot->event;
++        after = __atomic_load_n(&slot->version, __ATOMIC_ACQUIRE);
++        if (before == after && !(after & 1U) && event.seq == seq)
++            events[count++] = event;
+         ++seq;
+     }
+ 

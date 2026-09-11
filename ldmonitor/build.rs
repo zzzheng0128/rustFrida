@@ -59,13 +59,9 @@ fn main() -> anyhow::Result<()> {
         return Err(anyhow!("ebpf cargo build failed: {status}"));
     }
 
-    let built = target_dir
-        .join("bpfel-unknown-none")
-        .join("release")
-        .join("ldmonitor");
+    let built = target_dir.join("bpfel-unknown-none").join("release").join("ldmonitor");
     let dst = out_dir.join("ldmonitor");
-    std::fs::copy(&built, &dst)
-        .with_context(|| format!("copy {} -> {}", built.display(), dst.display()))?;
+    std::fs::copy(&built, &dst).with_context(|| format!("copy {} -> {}", built.display(), dst.display()))?;
 
     // strip 调试段（含残余路径）；.BTF 段保留
     let strip = std::env::var("LLVM_STRIP").unwrap_or_else(|_| "llvm-strip".to_string());

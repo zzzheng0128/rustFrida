@@ -27,7 +27,12 @@ use crate::communication::{log_msg, write_stream};
 
 const JAVA_WORKER_EVAL_TIMEOUT_MS: u64 = 60_000;
 const JAVA_WORKER_BUSY_FAST_FAIL_MS: u64 = 500;
-const JAVA_WORKER_LOOP_READY_TIMEOUT_MS: u64 = 1_500;
+// Thread.start() is asynchronous.  On ART 35 (Pixel 6) the managed thread
+// can take several seconds to reach nativeLoop while the app is leaving the
+// spawn stop.  A short timeout makes the caller clear STARTED even though the
+// managed thread is still on its way, which permits a second worker to be
+// created and leaves the first one orphaned.
+const JAVA_WORKER_LOOP_READY_TIMEOUT_MS: u64 = 10_000;
 
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -40,6 +45,10 @@ static JAVA_WORKER_NATIVE_RELEASED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_TID: AtomicI32 = AtomicI32::new(0);
 static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
+// Serialize the check/enqueue/wait sequence.  javaworker_init and a first
+// java_jseval can arrive close together; without this lock both callers can
+// observe STARTED=false and install separate dynamic worker classes.
+static JAVA_WORKER_START_LOCK: Mutex<()> = Mutex::new(());
 static HOOK_EXEC_VMA_NAME: &[u8] = b"dalvik-jit-code-cache\0";
 
 enum JavaWorkerTask {
@@ -326,6 +335,7 @@ fn wait_java_worker_loop_entered(timeout_ms: u64) -> bool {
 }
 
 pub fn start_java_worker() -> Result<(), String> {
+    let _start_guard = JAVA_WORKER_START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if JAVA_WORKER_STARTED.load(Ordering::Acquire) {
         if JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire) {
             return Ok(());
@@ -410,6 +420,16 @@ fn wait_java_worker_stopped(had_worker: bool, timeout_ms: u64) -> bool {
 
 pub fn eval_on_java_worker(script: String, filename: String, init_engine: bool) -> Result<String, String> {
     start_java_worker()?;
+    eval_on_running_java_worker(script, filename, init_engine)
+}
+
+/// Queue an eval on the already-started managed worker.
+///
+/// This deliberately does not call `start_java_worker()`: post-resume
+/// recovery commands must never turn a not-yet-observed worker into a second
+/// dynamic dex class.  Callers that need lazy startup should use
+/// `eval_on_java_worker` instead.
+pub fn eval_on_running_java_worker(script: String, filename: String, init_engine: bool) -> Result<String, String> {
     if !JAVA_WORKER_LOOP_RUNNING.load(Ordering::Acquire) {
         return Err("Java worker loop is not running".to_string());
     }
@@ -507,7 +527,10 @@ pub fn cleanup() -> bool {
     //   等不到就整体保留，不进入后续任何破坏性步骤。
     // ============================================================
     if !quickjs_hook::begin_engine_shutdown(std::time::Duration::from_secs(3)) {
-        log_msg("[quickjs] engine shutdown gate: top-level executions still in flight; destructive cleanup skipped\n".to_string());
+        log_msg(
+            "[quickjs] engine shutdown gate: top-level executions still in flight; destructive cleanup skipped\n"
+                .to_string(),
+        );
         detach_current_jni_thread();
         stage("cleanup detach_jni_thread", &mut t);
         return false;
@@ -635,7 +658,10 @@ pub fn cleanup() -> bool {
     detach_current_jni_thread();
     stage("phase4 detach_jni_thread", &mut t);
     if !cleanup_engine() {
-        log_msg("[quickjs] cleanup_engine retained engine (top-level still in flight); destructive cleanup skipped\n".to_string());
+        log_msg(
+            "[quickjs] cleanup_engine retained engine (top-level still in flight); destructive cleanup skipped\n"
+                .to_string(),
+        );
         detach_current_jni_thread();
         return false;
     }
@@ -729,7 +755,10 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     //   与 cleanup() 同一前置协议，必须早于一切 JS 资源释放。
     //   最终卸载路径：闸门保持关闭，不重开。
     if !quickjs_hook::begin_engine_shutdown(std::time::Duration::from_secs(3)) {
-        log_msg("[quickjs] managed-safe unload: top-level executions still in flight; destructive cleanup skipped\n".to_string());
+        log_msg(
+            "[quickjs] managed-safe unload: top-level executions still in flight; destructive cleanup skipped\n"
+                .to_string(),
+        );
         detach_current_jni_thread();
         stage("cleanup detach_jni_thread", &mut t);
         return false;
@@ -822,7 +851,10 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     detach_current_jni_thread();
     stage("phase3 detach_jni_thread", &mut t);
     if !cleanup_engine() {
-        log_msg("[quickjs] cleanup_engine retained engine (top-level still in flight); destructive cleanup skipped\n".to_string());
+        log_msg(
+            "[quickjs] cleanup_engine retained engine (top-level still in flight); destructive cleanup skipped\n"
+                .to_string(),
+        );
         detach_current_jni_thread();
         return false;
     }
