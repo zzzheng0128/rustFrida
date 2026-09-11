@@ -5,3 +5,7 @@
 	path = quickjs-hook/third_party/tinycc
 	url = https://github.com/kkkbbb/tinycc.git
 	branch = rf/cmodule-runtime
+[submodule "mkpms"]
+	path = mkpms
+	url = https://github.com/zzzheng0128/mkpms.git
+	branch = mkpm-merged
