@@ -16,8 +16,13 @@ bash examples/rustfrida-compat-app/build_demo.sh
 bash .build-android.sh rust_frida
 
 # 3. 安装、spawn、运行 60 秒并拉回日志（0=全部通道）
-RUN_SECS=60 BUILD_RF=0 bash examples/rustfrida-compat-app/run_demo_spawn.sh 0
+DEVICE_SERIAL=18201FDF6002GR RUN_SECS=60 BUILD_RF=0 \
+  bash examples/rustfrida-compat-app/run_demo_spawn.sh 0
 ```
+
+本轮兼容性验证只针对 Pixel 6（`18201FDF6002GR`，Android 15 / 6.1.99）；Pixel 5
+是另一组实验设备，不要把它的日志或内核结论并入本 demo 报告。运行器会把每轮的
+serial、机型和内核写进 `device-before/`、`device-after/` 以及 `SUMMARY.txt`。
 
 同一个入口也提供 `mkpm.kpm` 能力总览。它使用 `kpctl` 控制已经合并的 KPM，
 不会另加载 `wxshadow.kpm` 或其他旧模块：
@@ -237,7 +242,7 @@ host 文本会把已解析的地址直接写成 `0x地址(模块.so+0x偏移)`�
 | `1` | `c` | `test_compat_demo.js` 的 `installNativeHook()` → `rf_agent_hot` |
 | `2` | `java` | `installJavaHooks()`、`DexProbe` 和 `DexPayload.run()` |
 | `3` | `svc` | `native_demo.c` 的 `nativeSvcBurst()` / `.init_array` raw SVC |
-| `4` | `jnitrace` | `installJniTrace()` → `Native.nativeRegisterJniProbe()` → `JniProbe` |
+| `4` | `jnitrace` | `installJniTrace()`：93 个系统 JNIEnv 表槽 + RegisterNatives + `JniProbe.probeExercise()` 主动触发 |
 | `5` | `hwbp` | `armKernelTrace()` 的执行/读/写观察点和 method-slot gate |
 | `6` | `uprobe` | `KT>brk libcompatdemo.so` 软件探针 |
 | `16` | `hwbp-matrix` | 6 个执行断点 + 4 个读写观察点的硬件槽位矩阵 |
@@ -249,12 +254,12 @@ host 文本会把已解析的地址直接写成 `0x地址(模块.so+0x偏移)`�
 | `9` | `mkpm-probe` | `kpctl syscall` + compatdemo 的 raw SVC/proc/socket/mmap 探针 |
 | `10` | `mkpm-crc32` | `wxshadow enable/disable` + CRC32 对照 |
 | `11` | `mkpm-hide` | `hide maps` 开关 + compatdemo maps 对照 |
-| `12` | `mkpm-redirect` | UID+精确路径重定向 + compatdemo marker 对照 |
+| `12` | `mkpm-redirect` | `eredirect` UID+精确路径重定向 + 同一 App 内关闭/开启对照 |
 | `13` | `mkpm-time` | 目标 UID 的 `CLOCK_BOOTTIME` 减 600 秒，与 root shell `/proc/uptime` 对照 |
-| `14` | `mkpm-inode` | 下发 `emaps addino`，对照 App 与 root shell 看到的 maps inode |
+| `14` | `mkpm-inode` | 同一 App 内对照 emaps 关闭/开启前后的测试 VMA inode |
 | `15` | `mkpm-readlink` | 目标 UID 的指定 symlink 返回 `ENOENT`，root shell 仍能读到原目标 |
 
-`13` 只改目标 UID 的 `clock_gettime(CLOCK_BOOTTIME)` 输出，不改系统全局时钟；日志会给出 App 与 root shell 的绝对差，约 600 秒才算生效。`14` 会把规则目标设为 inode `1`，然后在规则仍启用时分别读取 App 的 `/proc/self/maps` 和 root shell 的同一文件：两边 inode 不同才表示按 UID 隔离的改写真正生效。`15` 在应用私有目录创建测试 symlink，App 读取应为 `-ENOENT`，root shell 读取应保留原始目标。
+`13` 只改目标 UID 的 `clock_gettime(CLOCK_BOOTTIME)` 输出，不改系统全局时钟；日志会给出 App 与 root shell 的绝对差，约 600 秒才算生效。`14` 会先在规则关闭时读取测试 VMA 的原始 inode，再启用 `emaps addino ... 1` 并在同一 App 进程内重新读取；日志显示 `关闭=<原值>，开启=1` 才表示规则生效，不依赖 shell 读取进程 maps。`12` 也采用同一 App 内对照：关闭规则时 marker 不存在，`open=-2`；开启后同一个 App 读取到 `mkpm-redirect-target` 才算生效，摘要会写 `redirect_compare_scope=app-only`，整个判定不读取 shell 结果。runner 使用 KPM 的正式控制名 `eredirect`，菜单名仍写作 redirect 便于按功能选择。`15` 在应用私有目录创建测试 symlink，App 读取应为 `-ENOENT`，root shell 仍可用于确认原始目标。
 
 Pixel6 上 runner 默认复用已经加载的 `mkpm`。KPM 的 exit 路径会先清空本模块回调，
 再保留 KernelPatch 的无回调跳板，避免卸载后其他 CPU 访问已释放的 hook 链；设置
@@ -274,7 +279,8 @@ bash examples/rustfrida-compat-app/run_demo_spawn.sh jnitrace,gumtrace
 
 代码位置：`CompatApplication.onCreate()` 是最早启动入口，`MainActivity` 负责选择模式，
 `StressRunner` 是各压力线程，`native_demo.c` 是 C/SVC/HWBP/JNI 注册和 mkpm 探针实现，
-`JniProbe.java` 是动态 JNI 注册目标。脚本位于 `test_compat_demo.js`；可复用的独立
+`JniProbe.java` 是动态 JNI 注册目标；其中 `probeExercise()` 会主动走一遍 JNI
+表函数，制造可核对的系统 JNI 命中。脚本位于 `test_compat_demo.js`；可复用的独立
 GumTrace 模板位于 [`../../examples/templates/07_gumtrace.js`](../../examples/templates/07_gumtrace.js)。
 其他通用能力模板集中在 [`../../examples/templates/`](../../examples/templates/)：
 `08_memory_dump.js`（内存转储）、`09_file_io.js`（读写文件）、`10_memory_rw.js`

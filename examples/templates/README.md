@@ -7,7 +7,7 @@
 | `01_native_hook.js` | `Interceptor.attach` 观察 native 导出 |
 | `02_java_hook.js` | `Java.ready` + `Java.use` 观察 Java 方法 |
 | `03_kernel_trace.js` | hybrid 模式的 `KT>` uprobe/HWBP 桥接；含 `bpdel` 释放和复用辅助函数 |
-| `04_jni_trace.js` | `Jni.addr("RegisterNatives")` 观察 JNI 注册 |
+| `04_jni_trace.js` | JNIEnv 函数表系统 JNI 追踪（类/方法/字段/字符串/数组/注册等） |
 | `05_memory_probe.js` | 只读模块内存并输出 hex |
 | `06_agent_replace.js` | `hook()` 替换式 native hook，并显式调用 `$orig` |
 | `07_gumtrace.js` | GumTrace 指令级追踪（默认目标为兼容性 demo） |

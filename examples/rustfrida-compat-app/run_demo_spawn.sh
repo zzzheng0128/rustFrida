@@ -49,6 +49,7 @@ KPM_REMOTE="${KPM_REMOTE:-/data/local/tmp/mkpm.kpm}"
 KPCTL_REMOTE="${KPCTL_REMOTE:-}"
 KPCTL_HOST="${KPCTL_HOST:-$REPO_ROOT/../dyidre/tools/kpctl/kpctl}"
 KPM_RF_HOLD_SECS="${KPM_RF_HOLD_SECS:-12}"
+KPM_RF_TIMEOUT_SECS="${KPM_RF_TIMEOUT_SECS:-$((KPM_RF_HOLD_SECS + 20))}"
 KPM_RELOAD="${KPM_RELOAD:-0}"
 KPM_MARKER="/data/local/tmp/rfcompat-mkpm-marker"
 KPM_MAP_PATH="/data/local/tmp/rfcompat-mkpm-map"
@@ -116,12 +117,17 @@ print_log_guide() {
           `instructions`（命中 PC 起连续 16 条 ARM64 指令，含 asm）
   HWBP轮换  选择 19；每个地址命中 3 次后要看到 `phase=detach`、host 的
           `hwbp detached`，再看到下一个 `phase=attach`；这证明槽位被复用。
-  JNI     `RegisterNatives hook installed` + `registered=1` 或 RegisterNatives class=
+  JNI     `table hooks installed=93/93` 且 `observed_jni_system>0`，并看到 `registered=1`
   GumTrace `GumTrace armed` + `GumTrace started`，且 gumtrace 输出文件非空
   KPM     `loaded (rc=0)`，status 中目标开关为 1，控制命令返回 `ok` 或有效结果
   CRC32   `WXSHADOW installed` + `PROBE1 crc_match=true`；NORMAL 对照应为 false
   boot    输出 `目标约 600s，规则生效`
-  inode/readlink 输出 `视角已分离，规则生效`
+  hide    会动态加入 `libcompatdemo.so` token；应看到 maps_has_demo=0/1/0，分别对应开/关/恢复。
+  inode   输出 `关闭=<原值>，开启=1`；redirect 在 Pixel6 上应看到 `supported=1`，
+          且同一 App 开启后读到 `data=mkpm-redirect-target`（只做 App 内前后对照，
+          不读取 shell 结果）；其他未完成 ABI 验证的内核
+          看到 `supported=0` 才是安全熔断 WARN。
+          runner 下发的是 `eredirect <uid> addexact ...`，菜单中的 redirect 是易懂简称。
 
   结果文件：rf-output.log（终端镜像）、trace-output.jsonl（完整事件）、
   SUMMARY.txt（计数和退出码）；失败时再看同目录的具体 lane.log 和 logcat.txt。
@@ -152,7 +158,7 @@ RustFrida compatibility demo
   9  mkpm-probe   kpctl syscall + compatdemo raw SVC 探针
  10  mkpm-crc32   wxshadow 开/关 + CRC32 内存对照
   11  mkpm-hide    hide maps 开/关 + compatdemo maps 对照
-  12  mkpm-redirect redirect UID+精确路径替换 + compatdemo 对照
+  12  mkpm-redirect redirect UID+精确路径替换 + App 内关闭/开启对照
  13  mkpm-time    目标 UID 的 CLOCK_BOOTTIME 减 600 秒，和 shell 对照
  14  mkpm-inode   emaps addino + rfcompat-mkpm-map inode 对照
  15  mkpm-readlink antidetect readlink：目标 UID 返回 ENOENT，shell 返回原目标
@@ -175,6 +181,7 @@ RustFrida compatibility demo
           阶段最长等待）、VERIFY_DRAIN_SECS=2（退出前最终对账后的 drain 秒数）、
           LOW_FREQ=1（默认低频）、EXTREME=1（压力档，会覆盖低频）、
           LOW_FREQ=0（普通频率）、BUILD_APP=1、BUILD_RF=1、DEVICE_SERIAL=...
+          KPM_RF_HOLD_SECS=12（KPM 探针保持时间）、KPM_RF_TIMEOUT_SECS=32（远端兜底超时）
           KT_HWBP_MAX_BREAKPOINTS=6、KT_HWBP_MAX_WATCHPOINTS=4（用于验证设备
           的执行/观察槽位上限；默认按 Pixel 6 常见的 6+4 运行）、
           KPM_RELOAD=1（应用 force-stop 后验证受保护的 mkpm 卸载；反复多次后重启回收空链槽位）
@@ -259,6 +266,12 @@ run_kpm_demo() {
     local kpm_run_id="$(date +%Y%m%d-%H%M%S)"
     local kpm_run_dir="${RUN_DIR:-$REPO_ROOT/runs/compat-demo/$kpm_run_id}"
     local kpm_main_log="$kpm_run_dir/mkpm.log"
+    local inode_before="" inode_after="" inode_verdict="not-run"
+    local hide_on_demo="" hide_off_demo="" hide_restored_demo="" hide_verdict="not-run"
+    local redirect_before_open="" redirect_after_open="" redirect_after_data=""
+    local redirect_compare_scope="app-only"
+    local redirect_supported="unknown" redirect_verdict="not-run" kpm_verdict=0
+    local kpm_device_serial="unknown" kpm_device_model="unknown" kpm_device_kernel="unknown"
     local kpm_remote_probe=/data/local/tmp/rfcompat-mkpm-probe.js
     local kpm_remote_crc=/data/local/tmp/rfcompat-mkpm-crc32.js
     local kpm_remote_rf=/data/local/tmp/rustfrida
@@ -266,6 +279,15 @@ run_kpm_demo() {
     KPM_RESULT_DIR="$kpm_run_dir"
 
     mkdir -p "$kpm_run_dir"
+    # KPM 单项在主 trace 流程之外运行，也要把设备身份写入本轮目录，
+    # 避免多台手机同时在线时把 Pixel 5 的结果混进 Pixel 6 报告。
+    kpm_device_serial="$(adb_do get-serialno 2>/dev/null | tr -d '\r\n ' || true)"
+    kpm_device_model="$(adb_do shell getprop ro.product.model 2>/dev/null | tr -d '\r\n' || true)"
+    kpm_device_kernel="$(adb_do shell uname -r 2>/dev/null | tr -d '\r\n' || true)"
+    mkdir -p "$kpm_run_dir/device-before"
+    printf '%s\n' "$kpm_device_serial" > "$kpm_run_dir/device-before/serial.txt"
+    printf '%s\n' "$kpm_device_model" > "$kpm_run_dir/device-before/model.txt"
+    printf '%s\n' "$kpm_device_kernel" > "$kpm_run_dir/device-before/kernel-release.txt"
     kpm_log() { echo "[$(date +%H:%M:%S)] [mkpm] $*" | tee -a "$kpm_main_log"; }
     kpm_su() { adb_do shell su -c "$1"; }
     kpm_best() {
@@ -333,10 +355,16 @@ run_kpm_demo() {
         kpm_log "$label: attach pid=${pid} script=${script}（实时输出，完整日志=${output}）"
         set +e
         (sleep "$KPM_RF_HOLD_SECS") |
-            adb_do shell su -c "$kpm_remote_rf --pid $pid -l $script" 2>&1 |
+            adb_do shell su -c "timeout $KPM_RF_TIMEOUT_SECS $kpm_remote_rf --pid $pid -l $script" 2>&1 |
             tee "$output" | tee -a "$kpm_main_log"
         rc="${PIPESTATUS[1]:-1}"
         set -e
+        # Ctrl-C/设备掉线时 adb 可能只退出本地管道，远端 rustfrida 仍会
+        # 占着目标线程的 ptrace。清理它，避免下一轮出现二次 attach 或把
+        # 应用留在 stopped 状态；正常 rc=0 不打扰其他用户进程。
+        if (( rc != 0 )); then
+            adb_do shell su -c "for p in \$(pidof rustfrida 2>/dev/null); do kill -TERM \$p; done" >/dev/null 2>&1 || true
+        fi
         kpm_log "$label: rustfrida rc=$rc"
         if (( rc == 0 )); then
             status_ok "${label} 成功"
@@ -493,46 +521,81 @@ run_kpm_demo() {
     fi
     if kpm_has mkpm-hide || kpm_has hide; then
         kpm_control "hide status"
+        # 动态加入 demo 自己的 so 名称，才能验证 maps 过滤本身；只看
+        # maps_has_frida 会把“规则存在”和“规则生效”混为一谈。
+        kpm_control "hide token add libcompatdemo.so"
         kpm_control "hide enable maps"
         kpm_probe hide-on
         kpm_control "hide disable maps"
         kpm_probe hide-off
         kpm_control "hide enable maps"
         kpm_probe hide-restored
+        local hide_on_log="$kpm_run_dir/hide-on.log"
+        local hide_off_log="$kpm_run_dir/hide-off.log"
+        local hide_restored_log="$kpm_run_dir/hide-restored.log"
+        hide_on_demo="$(grep -aoE '"maps_has_demo":[0-9]+' "$hide_on_log" 2>/dev/null | tail -1 | sed 's/.*://' || true)"
+        hide_off_demo="$(grep -aoE '"maps_has_demo":[0-9]+' "$hide_off_log" 2>/dev/null | tail -1 | sed 's/.*://' || true)"
+        hide_restored_demo="$(grep -aoE '"maps_has_demo":[0-9]+' "$hide_restored_log" 2>/dev/null | tail -1 | sed 's/.*://' || true)"
+        if [[ "$hide_on_demo" == "0" && "$hide_off_demo" == "1" && "$hide_restored_demo" == "0" ]]; then
+            hide_verdict="pass"
+            kpm_log "hide 结果：开启=${hide_on_demo}，关闭=${hide_off_demo}，恢复=${hide_restored_demo}（libcompatdemo.so 在 maps 视角按开关隐藏）"
+            status_ok "hide maps 功能验证 PASS"
+        else
+            hide_verdict="fail"
+            kpm_verdict=1
+            kpm_log "hide 结果：开启=${hide_on_demo:-?}，关闭=${hide_off_demo:-?}，恢复=${hide_restored_demo:-?}（未形成有效开关对照）"
+            status_fail "hide maps 功能验证 FAIL（详见 hide-on.log/hide-off.log/hide-restored.log）"
+        fi
+        kpm_control "hide token del libcompatdemo.so"
     fi
     if kpm_has mkpm-inode || kpm_has inode; then
         local uid="$(kpm_uid || true)"
         if [[ -n "$uid" ]]; then
-            kpm_log "inode：emaps 将 rfcompat-mkpm-map 的 maps inode 替换为 1（uid=${uid}）"
+            kpm_log "inode：先读取关闭规则时的测试 VMA，再启用 emaps 后读取同一测试 VMA（uid=${uid}）"
             kpm_control "hide disable maps"
-            kpm_control "emaps $uid addino rfcompat-mkpm-map 1"
-            kpm_control "emaps $uid hook"
+            # 先确保上一轮没有遗留 emaps 规则，然后读取同一个 App 的原始值。
+            # 不需要 root shell 对照；探针每次都会重新 mmap/munmap 测试文件。
+            kpm_control "emaps $uid unhook"
+            kpm_control "emaps $uid clear"
             kpm_control "emaps $uid list"
             local inode_pid="$(kpm_pid || true)"
             if [[ -n "$inode_pid" ]]; then
-                kpm_attach inode-replaced "$kpm_remote_probe" "$inode_pid"
+                kpm_attach inode-before "$kpm_remote_probe" "$inode_pid"
+            else
+                kpm_log "inode：找不到 $PACKAGE 进程，无法读取关闭规则基线"
+            fi
+            local inode_before_log="$kpm_run_dir/inode-before.log"
+            inode_before="$(grep -aoE '"maps_target_inode":[0-9]+' "$inode_before_log" 2>/dev/null | tail -1 | sed 's/.*://' || true)"
+
+            # 再启用目标 UID 的 inode 替换规则，重新在同一个 App 进程内读取。
+            kpm_control "emaps $uid addino rfcompat-mkpm-map 1"
+            kpm_control "emaps $uid hook"
+            kpm_control "emaps $uid list"
+            if [[ -n "$inode_pid" ]]; then
+                kpm_attach inode-after "$kpm_remote_probe" "$inode_pid"
             else
                 kpm_log "inode：找不到 $PACKAGE 进程，跳过探针"
             fi
-            local inode_log="$kpm_run_dir/inode-replaced.log"
-            local observed_inode="$(grep -aoE '"maps_target_inode":[0-9]+' "$inode_log" | tail -1 | sed 's/.*://' || true)"
-            local shell_inode=""
-            local shell_line=""
-            if [[ -n "$inode_pid" ]]; then
-                # KPM 规则按 App UID 生效，root shell 不匹配；同一 VMA 的两次读取
-                # 因而可以直接验证“进程内视角”和“shell 视角”是否分离。
-                shell_line="$(kpm_su "grep -F '$KPM_MAP_PATH' /proc/$inode_pid/maps | head -1" 2>/dev/null | tr -d '\r' | head -1 || true)"
-                shell_inode="$(printf '%s\n' "$shell_line" | awk 'NF >= 5 {print $5; exit}')"
-                printf '%s\n' "$shell_line" > "$kpm_run_dir/inode-shell.log"
-            fi
-            if [[ -n "$observed_inode" && -n "$shell_inode" && "$observed_inode" != "$shell_inode" ]]; then
-                kpm_log "inode 结果：App maps_target_inode=${observed_inode}，shell inode=${shell_inode}（视角已分离，规则生效）"
-            elif [[ -n "$observed_inode" && -n "$shell_inode" ]]; then
-                kpm_log "inode 结果：App maps_target_inode=${observed_inode}，shell inode=${shell_inode}（两边相同，规则未在该 maps 读取路径生效）"
-            elif [[ -n "$observed_inode" ]]; then
-                kpm_log "inode 结果：App maps_target_inode=${observed_inode}，shell inode 未取到（查看 inode-shell.log）"
+            local inode_after_log="$kpm_run_dir/inode-after.log"
+            inode_after="$(grep -aoE '"maps_target_inode":[0-9]+' "$inode_after_log" 2>/dev/null | tail -1 | sed 's/.*://' || true)"
+            if [[ "$inode_before" =~ ^[0-9]+$ && "$inode_after" == "1" && "$inode_before" != "1" ]]; then
+                inode_verdict="pass"
+                kpm_log "inode 结果：关闭=${inode_before}，开启=${inode_after}，目标=1（同一 App 进程内值已改变，规则生效）"
+                status_ok "inode 功能验证 PASS"
+            elif [[ "$inode_before" =~ ^[0-9]+$ && "$inode_after" =~ ^[0-9]+$ ]]; then
+                inode_verdict="fail"
+                kpm_verdict=1
+                kpm_log "inode 结果：关闭=${inode_before}，开启=${inode_after}，目标=1（值未按预期改变）"
+                status_fail "inode 功能验证 FAIL（详见 inode-before.log/inode-after.log）"
+            elif [[ -n "$inode_after" ]]; then
+                inode_verdict="review"
+                kpm_verdict=1
+                kpm_log "inode 结果：关闭=${inode_before:-?}，开启=${inode_after}（无法形成有效基线，查看 inode-before.log）"
             else
-                kpm_log "inode 结果：探针没有返回 maps_target_inode（请查看 ${inode_log}）"
+                inode_verdict="fail"
+                kpm_verdict=1
+                kpm_log "inode 结果：探针没有返回 maps_target_inode（查看 inode-before.log/inode-after.log）"
+                status_fail "inode 功能验证 FAIL（没有有效 maps_target_inode）"
             fi
             kpm_control "emaps $uid del rfcompat-mkpm-map"
             kpm_control "emaps $uid unhook"
@@ -580,14 +643,63 @@ run_kpm_demo() {
     if kpm_has mkpm-redirect || kpm_has redirect; then
         local uid="$(kpm_uid || true)"
         if [[ -n "$uid" ]]; then
-            kpm_su "printf 'mkpm-redirect-target\\n' > '$KPM_REDIRECT_TO'; chmod 644 '$KPM_REDIRECT_TO'"
-            kpm_control "redirect $uid addexact $KPM_MARKER $KPM_REDIRECT_TO"
-            kpm_control "redirect $uid hook"
-            kpm_control "redirect $uid status"
-            kpm_probe redirect-hit
-            kpm_control "redirect $uid del $KPM_MARKER"
-            kpm_control "redirect $uid unhook"
-            kpm_control "redirect $uid clear"
+            kpm_log "redirect：仅做同一 App 前后对照（不读取 shell）；先读取不存在的 marker，再启用 UID+精确路径规则读取替换内容（uid=${uid}）"
+            # marker 保持不存在，关闭规则时应得到 -ENOENT；目标文件使用无换行
+            # 的固定内容，便于从 nativeKpmProbe JSON 中精确判断是否真的读到了替换文件。
+            kpm_su "rm -f '$KPM_MARKER'; printf 'mkpm-redirect-target' > '$KPM_REDIRECT_TO'; chmod 644 '$KPM_REDIRECT_TO'"
+            # 已发布到设备的 mkpm 使用 dysvcpit 的正式子系统名
+            # `eredirect`；菜单仍称 redirect，便于新手按功能理解。
+            kpm_control "eredirect $uid unhook"
+            kpm_control "eredirect $uid clear"
+            kpm_control "eredirect $uid status"
+            redirect_supported="$(grep -aoE 'redirect: supported=[01]' "$kpm_main_log" 2>/dev/null | tail -1 | sed 's/.*=//' || true)"
+            kpm_probe redirect-before
+            local redirect_before_log="$kpm_run_dir/redirect-before.log"
+            redirect_before_open="$(grep -aoE '"open_marker":-?[0-9]+' "$redirect_before_log" 2>/dev/null | tail -1 | sed 's/.*://' || true)"
+
+            if [[ "$redirect_supported" != "1" ]]; then
+                # 只有明确完成 do_filp_open ABI/符号验证的设备才允许安装；
+                # supported=0 或状态缺失都安全熔断。Pixel6 当前版本应为 1。
+                redirect_verdict="unsupported"
+                if [[ "$redirect_supported" == "0" ]]; then
+                    kpm_log "redirect 结果：supported=0，当前内核安全熔断，跳过 addexact/hook（不会修改文件系统路径）"
+                    status_warn "redirect 在当前内核安全熔断（未安装 filesystem hook）"
+                else
+                    kpm_log "redirect 结果：未读到 supported=1（实际=${redirect_supported:-<空>}），安全跳过 addexact/hook（不会修改文件系统路径）"
+                    status_warn "redirect 状态未知，安全跳过 filesystem hook"
+                fi
+            else
+                kpm_control "eredirect $uid addexact $KPM_MARKER $KPM_REDIRECT_TO"
+                kpm_control "eredirect $uid hook"
+                kpm_probe redirect-after
+                local redirect_after_log="$kpm_run_dir/redirect-after.log"
+                redirect_after_open="$(grep -aoE '"open_marker":-?[0-9]+' "$redirect_after_log" 2>/dev/null | tail -1 | sed 's/.*://' || true)"
+                redirect_after_data="$(grep -aoE '"marker_data":"[^"]*"' "$redirect_after_log" 2>/dev/null | tail -1 | sed 's/.*:"//; s/"$//' || true)"
+                if [[ "$redirect_before_open" =~ ^-?[0-9]+$ && "$redirect_before_open" == "-2" \
+                      && "$redirect_after_open" =~ ^[0-9]+$ \
+                      && "$redirect_after_data" == "mkpm-redirect-target" ]]; then
+                    redirect_verdict="pass"
+                    kpm_log "redirect 结果：App 内关闭 open=${redirect_before_open}，开启 open=${redirect_after_open} data=${redirect_after_data}（同一 App 读到替换内容，规则生效；未使用 shell 对照）"
+                    status_ok "redirect 功能验证 PASS"
+                elif [[ -n "$redirect_after_open" || -n "$redirect_after_data" ]]; then
+                    redirect_verdict="fail"
+                    kpm_verdict=1
+                    kpm_log "redirect 结果：App 内关闭 open=${redirect_before_open:-?}，开启 open=${redirect_after_open:-?} data=${redirect_after_data:-<空>}（未读到预期替换内容；未使用 shell 对照）"
+                    status_fail "redirect 功能验证 FAIL（详见 redirect-before.log/redirect-after.log）"
+                else
+                    redirect_verdict="fail"
+                    kpm_verdict=1
+                    kpm_log "redirect 结果：App 内探针没有返回有效 open_marker（关闭=${redirect_before_open:-?}，开启=${redirect_after_open:-?}；未使用 shell 对照）"
+                    status_fail "redirect 功能验证 FAIL（没有有效探针结果）"
+                fi
+            fi
+            # 未支持的内核没有添加规则，跳过 del，避免把预期的
+            # error=-ENOENT 误报成一次失败清理。
+            if [[ "$redirect_supported" == "1" ]]; then
+                kpm_control "eredirect $uid del $KPM_MARKER"
+            fi
+            kpm_control "eredirect $uid unhook"
+            kpm_control "eredirect $uid clear"
             kpm_best "删除 redirect 测试文件" "rm -f '$KPM_REDIRECT_TO'"
         else
             kpm_log "redirect：无法解析 $PACKAGE UID，跳过"
@@ -631,7 +743,6 @@ run_kpm_demo() {
     adb_do shell su -c "am force-stop $PACKAGE" >/dev/null 2>&1 || true
     adb_do shell su -c "rm -f '$KPM_MAP_PATH' '$KPM_MARKER' '$KPM_REDIRECT_TO'" >/dev/null 2>&1 || true
     adb_do shell su -c "setprop debug.rustfrida.compat.mode all" >/dev/null 2>&1 || true
-    local kpm_verdict=0
     local crc_phase_pass_count=0 crc_phase_fail_count=0 crc_java_ready_errors=0
     if kpm_has mkpm-crc32 || kpm_has crc32; then
         # 进程 rc=0 只能说明 RustFrida 收尾成功；CRC 必须三个独立阶段
@@ -654,9 +765,25 @@ run_kpm_demo() {
         echo "kpctl=$kpm_ctl"
         echo "run_dir=$kpm_run_dir"
         echo "main_log=$kpm_main_log"
+        echo "device_serial=$kpm_device_serial"
+        echo "device_model=$kpm_device_model"
+        echo "device_kernel=$kpm_device_kernel"
         echo "crc_phase_pass_count=$crc_phase_pass_count"
         echo "crc_phase_fail_count=$crc_phase_fail_count"
         echo "crc_java_ready_errors=$crc_java_ready_errors"
+        echo "inode_before=$inode_before"
+        echo "inode_after=$inode_after"
+        echo "inode_verdict=$inode_verdict"
+        echo "hide_on_demo=$hide_on_demo"
+        echo "hide_off_demo=$hide_off_demo"
+        echo "hide_restored_demo=$hide_restored_demo"
+        echo "hide_verdict=$hide_verdict"
+        echo "redirect_supported=$redirect_supported"
+        echo "redirect_compare_scope=$redirect_compare_scope"
+        echo "redirect_before_open=$redirect_before_open"
+        echo "redirect_after_open=$redirect_after_open"
+        echo "redirect_after_data=$redirect_after_data"
+        echo "redirect_verdict=$redirect_verdict"
         echo "kpm_verdict=$kpm_verdict"
         grep -aE "\\[mkpm\\]|\\[mkpm-probe\\]|\\[CRC\\].*(VERDICT|PROBE|COMPARE|PHASE|CALL)" "$kpm_main_log" || true
         # syscall read 的首行和 boot_time 事件没有 [mkpm] 前缀，单独收进摘要。
@@ -796,6 +923,12 @@ capture_device_state() {
     local label="$1"
     local dir="$RUN_DIR/device-$label"
     mkdir -p "$dir"
+    # 每轮把 serial/model 一起归档，避免多设备（尤其 Pixel 5/Pixel 6）
+    # 时只看事件日志而误把不同内核的结果合并。
+    adb_do get-serialno > "$dir/serial.txt" 2>&1 || true
+    adb_do shell getprop ro.product.model > "$dir/model.txt" 2>&1 || true
+    adb_do shell getprop ro.build.version.release > "$dir/android-release.txt" 2>&1 || true
+    adb_do shell uname -r > "$dir/kernel-release.txt" 2>&1 || true
     adb_do shell su -c 'cat /proc/sys/kernel/random/boot_id' > "$dir/boot-id.txt" 2>&1 || true
     adb_do shell su -c 'getprop ro.boot.bootreason' > "$dir/bootreason.txt" 2>&1 || true
     adb_do shell su -c 'cat /proc/uptime' > "$dir/uptime.txt" 2>&1 || true
@@ -836,7 +969,13 @@ printf '[compat-runner] mode=%s app_mode=%s run=%ss\n' "$MODE_SPEC" "$RF_MODE" "
 printf '[compat-runner] output=%s\n' "$RUN_DIR"
 status_step "等待 Android 设备"
 if adb_do wait-for-device >/dev/null; then
-    status_ok "Android 设备已连接"
+    DEVICE_SERIAL_RESOLVED="$(adb_do get-serialno 2>/dev/null | tr -d '\r\n ' || true)"
+    DEVICE_MODEL_RESOLVED="$(adb_do shell getprop ro.product.model 2>/dev/null | tr -d '\r\n' || true)"
+    DEVICE_KERNEL_RESOLVED="$(adb_do shell uname -r 2>/dev/null | tr -d '\r\n' || true)"
+    status_ok "Android 设备已连接 serial=${DEVICE_SERIAL_RESOLVED:-unknown} model=${DEVICE_MODEL_RESOLVED:-unknown} kernel=${DEVICE_KERNEL_RESOLVED:-unknown}"
+    if [[ "${DEVICE_SERIAL_RESOLVED:-}" == "0A291FDD40011F" || "${DEVICE_MODEL_RESOLVED:-}" == "Pixel 5" ]]; then
+        status_warn "检测到 Pixel 5；本轮只采信 Pixel 6，建议设置 DEVICE_SERIAL=18201FDF6002GR"
+    fi
     capture_device_state before
 else
     rc=$?
@@ -1016,6 +1155,7 @@ VERIFY_SOURCE_JAVA="$(verify_field source_java)"; VERIFY_OBSERVED_JAVA="$(verify
 VERIFY_SOURCE_DEX="$(verify_field source_dex)"; VERIFY_OBSERVED_DEX="$(verify_field observed_dex)"
 VERIFY_SOURCE_DEXPAYLOAD="$(verify_field source_dexPayload)"; VERIFY_OBSERVED_DEXPAYLOAD="$(verify_field observed_dexPayload)"
 VERIFY_SOURCE_JNI="$(verify_field source_jni)"; VERIFY_OBSERVED_JNI="$(verify_field observed_jni)"
+VERIFY_OBSERVED_JNI_SYSTEM="$(verify_field observed_jni_system)"
 VERIFY_SOURCE_METHOD="$(verify_field source_method)"; VERIFY_OBSERVED_METHOD="$(verify_field observed_method)"
 VERIFY_GATE_TIMEOUTS="$(verify_field gate_timeouts)"
 VERIFY_MISSING="$(verify_field missing)"
@@ -1027,6 +1167,7 @@ VERIFY_MISSING="$(verify_field missing)"
 : "${VERIFY_SOURCE_DEX:=0}" "${VERIFY_OBSERVED_DEX:=0}"
 : "${VERIFY_SOURCE_DEXPAYLOAD:=0}" "${VERIFY_OBSERVED_DEXPAYLOAD:=0}"
 : "${VERIFY_SOURCE_JNI:=0}" "${VERIFY_OBSERVED_JNI:=0}"
+: "${VERIFY_OBSERVED_JNI_SYSTEM:=0}"
 : "${VERIFY_SOURCE_METHOD:=0}" "${VERIFY_OBSERVED_METHOD:=0}"
 HWBP_MATRIX_LINES="$(grep -a '\[HWBP-MATRIX\]' "$RUN_DIR/rf-output.log" 2>/dev/null || true)"
 HWBP_MATRIX_SPEC_COUNT="$(printf '%s\n' "$HWBP_MATRIX_LINES" | sed -n 's/.*\[HWBP-MATRIX\] \([^ ]*\).*/\1/p' | sort -u | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -1138,6 +1279,9 @@ selected_modes=$MODE_SPEC
 stress_mode=$profile
 low_frequency=$LOW_FREQ
 rustfrida_mode=$RF_MODE
+device_serial=${DEVICE_SERIAL_RESOLVED:-${DEVICE_SERIAL:-unknown}}
+device_model=${DEVICE_MODEL_RESOLVED:-unknown}
+device_kernel=${DEVICE_KERNEL_RESOLVED:-unknown}
 apk=$APK
 rf_binary=$RF_BIN
 script=$JS_FILE
@@ -1172,6 +1316,7 @@ source_dexPayload=${VERIFY_SOURCE_DEXPAYLOAD:-0}
 observed_dexPayload=${VERIFY_OBSERVED_DEXPAYLOAD:-0}
 source_jni=${VERIFY_SOURCE_JNI:-0}
 observed_jni=${VERIFY_OBSERVED_JNI:-0}
+observed_jni_system=${VERIFY_OBSERVED_JNI_SYSTEM:-0}
 source_method=${VERIFY_SOURCE_METHOD:-0}
 observed_method=${VERIFY_OBSERVED_METHOD:-0}
 gate_timeouts=${VERIFY_GATE_TIMEOUTS:-0}
@@ -1210,6 +1355,7 @@ trace_output=$RUN_DIR/trace-output.jsonl
 anomaly_output=$RUN_DIR/anomaly.jsonl
 gumtrace_output=$RUN_DIR/gumtrace-compatdemo.log
 logcat=$RUN_DIR/logcat.txt
+anomaly_report=$RUN_DIR/ANOMALY_REPORT.txt
 EOF_SUMMARY
 if [[ -n "$HWBP_MATRIX_LINES" ]]; then
     {
@@ -1225,7 +1371,50 @@ if [[ -n "$UPROBE_MATRIX_LINES" ]]; then
         echo "uprobe_matrix_report_end"
     } >> "$RUN_DIR/SUMMARY.txt"
 fi
+# 每轮自动生成一份小报告，避免只保存原始日志而没有异常结论。原始
+# anomaly.jsonl/logcat/rf-output 仍然保留，报告只做可复核的关键词计数。
+ANOMALY_MARKERS="$( (grep -aE -i 'Fatal signal|FATAL EXCEPTION|SIGABRT|SIGSEGV|JNI DETECTED|target_gone|kernel panic|KERNEL PANIC|未知 frame kind|未知 agent frame kind|attach failed|hook failed' "$RUN_DIR/rf-output.log" "$RUN_DIR/logcat.txt" 2>/dev/null || true) | wc -l | tr -d ' ' )"
+EXPECTED_DISCONNECTS="$( (grep -a '"reason":"agent_disconnect".*"expected":true' "$RUN_DIR/anomaly.jsonl" 2>/dev/null || true) | wc -l | tr -d ' ' )"
+PSTORE_CHANGED=0
+if [[ -f "$RUN_DIR/device-before/console-ramoops-0.txt" &&
+      -f "$RUN_DIR/device-after/console-ramoops-0.txt" ]] &&
+   ! cmp -s "$RUN_DIR/device-before/console-ramoops-0.txt" "$RUN_DIR/device-after/console-ramoops-0.txt"; then
+    PSTORE_CHANGED=1
+fi
+PSTORE_MARKERS="$( (grep -aE -i 'panic|fatal|oops|watchdog|BUG:' "$RUN_DIR/device-after/console-ramoops-0.txt" "$RUN_DIR/device-after/pmsg-ramoops-0.txt" 2>/dev/null || true) | wc -l | tr -d ' ' )"
+ANOMALY_STATUS="PASS"
+if (( FATAL_LOG_LINES > 0 || UNEXPECTED_ANOMALIES > 0 || DEVICE_REBOOT == 1 )); then
+    ANOMALY_STATUS="FAIL"
+elif (( ANOMALY_MARKERS > 0 )); then
+    ANOMALY_STATUS="REVIEW"
+fi
+cat > "$RUN_DIR/ANOMALY_REPORT.txt" <<EOF_ANOMALY
+run_id=$RUN_ID
+anomaly_status=$ANOMALY_STATUS
+fatal_log_lines=$FATAL_LOG_LINES
+unexpected_anomalies=$UNEXPECTED_ANOMALIES
+device_reboot=$DEVICE_REBOOT
+expected_agent_disconnects=$EXPECTED_DISCONNECTS
+diagnostic_marker_lines=$ANOMALY_MARKERS
+pstore_changed=$PSTORE_CHANGED
+pstore_marker_lines=$PSTORE_MARKERS
+target_pid=$TARGET_PID
+
+判定说明：
+- anomaly_status=PASS：没有目标致命日志、未预期异常或设备重启；预期 agent_disconnect 不算异常。
+- anomaly_status=REVIEW：出现诊断关键词，需要回看原始日志，但不自动认定应用崩溃。
+- anomaly_status=FAIL：出现致命日志、未预期 anomaly 或 boot_id 改变。
+- pstore_changed=1：本轮前后 ramoops 内容发生变化，应结合 console-ramoops-0.txt/pmsg-ramoops-0.txt 查看；旧 pstore 内容不会单独判定本轮失败。
+
+原始文件：
+- SUMMARY.txt
+- rf-output.log
+- trace-output.jsonl
+- anomaly.jsonl
+- logcat.txt
+EOF_ANOMALY
 cat "$RUN_DIR/SUMMARY.txt"
+cat "$RUN_DIR/ANOMALY_REPORT.txt"
 
 # 这里判定的是“运行链路是否完成”，具体通道是否命中仍以摘要计数为准。
 # 未知 frame 已在 agent 侧限流，作为诊断警告显示，不把它误判成业务失败。

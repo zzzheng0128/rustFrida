@@ -1885,11 +1885,13 @@ fn apply_command(
                 .try_into()?;
             // 重复 attach 会生成新 link,幂等加载无妨
             let _ = prog.load();
-            let scope = if *uprobe_pid != 0 {
-                UProbeScope::OneProcess(std::num::NonZeroU32::new(*uprobe_pid).unwrap())
-            } else {
-                UProbeScope::AllProcesses
-            };
+            // 动态 KT>brk 仍使用 AllProcesses，再由 FILTER 的 UID/PID 约束
+            // 事件范围。Pixel/Android 上 OneProcess uprobe 与同一进程的
+            // HWBP perf 事件组合时可能完全没有 BPF 入口；AllProcesses 是
+            // 旧实现使用的兼容路径，低频组合回归已确认可进入。这里只记录
+            // 实际 scope，便于每轮日志区分 attach 成功和内核事件是否进入。
+            trace_diag!("[trace-cmd] uprobe scope=AllProcesses (FILTER uid={uprobe_uid})");
+            let scope = UProbeScope::AllProcesses;
             prog.attach(offset, resolved.as_str(), scope)?;
             trace_diag!("[trace-cmd] uprobe attached: {resolved} +0x{offset:x}");
         }

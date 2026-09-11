@@ -95,6 +95,7 @@ static volatile uint64_t g_jni_register_attempts;
 static volatile uint64_t g_jni_register_successes;
 static volatile uint64_t g_jni_probe_tick_calls;
 static volatile uint64_t g_jni_probe_object_calls;
+static volatile uint64_t g_jni_probe_exercise_calls;
 static volatile uint64_t g_java_oncreate_calls;
 static volatile uint64_t g_dex_load_calls;
 static volatile uint64_t g_dex_payload_calls;
@@ -262,7 +263,7 @@ static uint64_t rf_monotonic_ns(void) {
 }
 
 /* jnitrace 专用实现：函数不导出 JNI 命名符号，稍后由 RegisterNatives
- * 把它们挂到 JniProbe.probeTick/probeObject 上。 */
+ * 把它们挂到 JniProbe 的三个动态方法上。 */
 static jlong rf_jni_probe_tick(JNIEnv *env, jobject thiz, jlong seed) {
     (void) env;
     (void) thiz;
@@ -277,6 +278,241 @@ static jlong rf_jni_probe_object(JNIEnv *env, jobject thiz, jint loops) {
     if (loops > 100000) loops = 100000;
     __atomic_add_fetch(&g_jni_probe_object_calls, 1, __ATOMIC_RELAXED);
     return (jlong) rf_object_step(rf_object_get(), (uint64_t) loops);
+}
+
+/*
+ * 主动走一遍常见 JNI 1.6 表槽，给 jnitrace 一个确定的源端。
+ *
+ * 这里故意使用 JNI C 接口，而不是 Java 反射 API：这样每个动作都会经过
+ * JNIEnv->functions 表，能直接验证 FindClass/GetMethodID、字段读写、
+ * Call*MethodA、字符串/数组、引用、异常、Monitor 和 DirectByteBuffer
+ * 等系统槽位。所有对象都在本次调用内释放，异常也会立刻清掉，不会污染
+ * 后续压力线程。
+ */
+static jlong rf_jni_probe_exercise(JNIEnv *env, jobject thiz, jint rounds) {
+    (void) thiz;
+    __atomic_add_fetch(&g_jni_probe_exercise_calls, 1, __ATOMIC_RELAXED);
+    if (rounds < 1) rounds = 1;
+    if (rounds > 16) rounds = 16;
+
+    jlong checksum = 0;
+    jint pushed = (*env)->PushLocalFrame(env, 96);
+    if (pushed != 0) return -1;
+    (*env)->EnsureLocalCapacity(env, 64);
+    checksum ^= (*env)->GetVersion(env);
+
+    jclass probe_class = (*env)->FindClass(env, "com/rustfrida/compatdemo/JniProbe");
+    jclass string_class = (*env)->FindClass(env, "java/lang/String");
+    jclass integer_class = (*env)->FindClass(env, "java/lang/Integer");
+    jclass boolean_class = (*env)->FindClass(env, "java/lang/Boolean");
+    jclass system_class = (*env)->FindClass(env, "java/lang/System");
+    jclass thread_class = (*env)->FindClass(env, "java/lang/Thread");
+    jclass builder_class = (*env)->FindClass(env, "java/lang/StringBuilder");
+    if (!probe_class || !string_class || !integer_class || !boolean_class ||
+        !system_class || !thread_class || !builder_class) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        (*env)->PopLocalFrame(env, NULL);
+        return -2;
+    }
+
+    checksum ^= (*env)->IsAssignableFrom(env, probe_class, probe_class);
+    checksum ^= (jlong) (*env)->GetSuperclass(env, probe_class);
+    jfieldID static_int = (*env)->GetStaticFieldID(env, probe_class, "exerciseStaticInt", "I");
+    jfieldID static_object = (*env)->GetStaticFieldID(env, probe_class,
+                                                       "exerciseStaticObject", "Ljava/lang/Object;");
+    jmethodID probe_ctor = (*env)->GetMethodID(env, probe_class, "<init>", "()V");
+    jmethodID string_to_string = (*env)->GetMethodID(env, string_class,
+                                                      "toString", "()Ljava/lang/String;");
+    jmethodID string_is_empty = (*env)->GetMethodID(env, string_class, "isEmpty", "()Z");
+    jmethodID string_length = (*env)->GetMethodID(env, string_class, "length", "()I");
+    jmethodID integer_value_of = (*env)->GetStaticMethodID(env, integer_class,
+                                                            "valueOf", "(I)Ljava/lang/Integer;");
+    jmethodID integer_parse_int = (*env)->GetStaticMethodID(env, integer_class,
+                                                             "parseInt", "(Ljava/lang/String;)I");
+    jmethodID boolean_parse = (*env)->GetStaticMethodID(env, boolean_class,
+                                                         "parseBoolean", "(Ljava/lang/String;)Z");
+    jmethodID system_nano_time = (*env)->GetStaticMethodID(env, system_class,
+                                                            "nanoTime", "()J");
+    jmethodID thread_yield = (*env)->GetStaticMethodID(env, thread_class, "yield", "()V");
+    jmethodID builder_ctor = (*env)->GetMethodID(env, builder_class, "<init>", "()V");
+    jmethodID builder_set_length = (*env)->GetMethodID(env, builder_class,
+                                                        "setLength", "(I)V");
+
+    jvalue no_args[1];
+    memset(no_args, 0, sizeof(no_args));
+    jstring text = (*env)->NewStringUTF(env, "rustfrida-jni-exercise");
+    jstring number_text = (*env)->NewStringUTF(env, "7");
+    jstring boolean_text = (*env)->NewStringUTF(env, "true");
+    const jchar utf16_text[] = {'j', 'n', 'i', '-', 'o', 'k'};
+    jstring utf16 = (*env)->NewString(env, utf16_text,
+                                      (jsize) (sizeof(utf16_text) / sizeof(utf16_text[0])));
+    jobject probe_object = probe_ctor ? (*env)->NewObjectA(env, probe_class, probe_ctor, no_args) : NULL;
+    jobject allocated = (*env)->AllocObject(env, probe_class);
+    if (text) (*env)->GetObjectClass(env, text);
+    (void) allocated;
+    checksum ^= (*env)->IsInstanceOf(env, text, string_class);
+
+    if (static_int) {
+        (*env)->SetStaticIntField(env, probe_class, static_int, 0x1234);
+        checksum ^= (*env)->GetStaticIntField(env, probe_class, static_int);
+    }
+    if (static_object && text) {
+        (*env)->SetStaticObjectField(env, probe_class, static_object, text);
+        checksum ^= (jlong) (*env)->GetStaticObjectField(env, probe_class, static_object);
+    }
+
+    jfieldID object_int = (*env)->GetFieldID(env, probe_class, "exerciseInt", "I");
+    jfieldID object_value = (*env)->GetFieldID(env, probe_class,
+                                                "exerciseObject", "Ljava/lang/Object;");
+    if (probe_object && object_int) {
+        (*env)->SetIntField(env, probe_object, object_int, 0x5678);
+        checksum ^= (*env)->GetIntField(env, probe_object, object_int);
+    }
+    if (probe_object && object_value && text) {
+        (*env)->SetObjectField(env, probe_object, object_value, text);
+        checksum ^= (jlong) (*env)->GetObjectField(env, probe_object, object_value);
+    }
+
+    jvalue int_arg[1];
+    memset(int_arg, 0, sizeof(int_arg));
+    int_arg[0].i = 7;
+    jvalue number_arg[1];
+    memset(number_arg, 0, sizeof(number_arg));
+    number_arg[0].l = number_text;
+    jvalue boolean_arg[1];
+    memset(boolean_arg, 0, sizeof(boolean_arg));
+    boolean_arg[0].l = boolean_text;
+    for (jint i = 0; i < rounds; i++) {
+        if (text && string_to_string)
+            checksum ^= (jlong) (*env)->CallObjectMethodA(env, text, string_to_string, no_args);
+        if (text && string_is_empty)
+            checksum ^= (*env)->CallBooleanMethodA(env, text, string_is_empty, no_args);
+        if (text && string_length)
+            checksum ^= (*env)->CallIntMethodA(env, text, string_length, no_args);
+        if (text && string_to_string)
+            checksum ^= (jlong) (*env)->CallNonvirtualObjectMethodA(
+                env, text, string_class, string_to_string, no_args);
+        if (text && string_length)
+            checksum ^= (*env)->CallNonvirtualIntMethodA(
+                env, text, string_class, string_length, no_args);
+        if (integer_value_of)
+            checksum ^= (jlong) (*env)->CallStaticObjectMethodA(
+                env, integer_class, integer_value_of, int_arg);
+        if (integer_parse_int && number_text)
+            checksum ^= (*env)->CallStaticIntMethodA(
+                env, integer_class, integer_parse_int, number_arg);
+        if (boolean_parse && boolean_text)
+            checksum ^= (*env)->CallStaticBooleanMethodA(
+                env, boolean_class, boolean_parse, boolean_arg);
+        if (system_nano_time)
+            checksum ^= (*env)->CallStaticLongMethodA(
+                env, system_class, system_nano_time, no_args);
+        if (thread_yield)
+            (*env)->CallStaticVoidMethodA(env, thread_class, thread_yield, no_args);
+    }
+
+    if (builder_ctor && builder_set_length) {
+        jobject builder = (*env)->NewObjectA(env, builder_class, builder_ctor, no_args);
+        jvalue length_arg[1];
+        memset(length_arg, 0, sizeof(length_arg));
+        length_arg[0].i = 0;
+        if (builder) {
+            (*env)->CallVoidMethodA(env, builder, builder_set_length, length_arg);
+            (*env)->CallNonvirtualVoidMethodA(env, builder, builder_class,
+                                               builder_set_length, length_arg);
+        }
+    }
+
+    if (text) {
+        jsize length = (*env)->GetStringLength(env, text);
+        jsize utf_length = (*env)->GetStringUTFLength(env, text);
+        jchar chars[64];
+        char utf_chars[128];
+        memset(chars, 0, sizeof(chars));
+        memset(utf_chars, 0, sizeof(utf_chars));
+        if (length > 0) (*env)->GetStringRegion(env, text, 0,
+                                                 length < 64 ? length : 64, chars);
+        if (length > 0) (*env)->GetStringUTFRegion(env, text, 0,
+                                                    length < 64 ? length : 64, utf_chars);
+        jboolean is_copy = JNI_FALSE;
+        const jchar *critical = (*env)->GetStringCritical(env, text, &is_copy);
+        if (critical) (*env)->ReleaseStringCritical(env, text, critical);
+        const jchar *wide = (*env)->GetStringChars(env, text, &is_copy);
+        if (wide) (*env)->ReleaseStringChars(env, text, wide);
+        const char *narrow = (*env)->GetStringUTFChars(env, text, &is_copy);
+        if (narrow) (*env)->ReleaseStringUTFChars(env, text, narrow);
+        checksum ^= length ^ utf_length;
+    }
+
+    jint int_values[4] = {1, 2, 3, 4};
+    jint int_region[4] = {0, 0, 0, 0};
+    jintArray ints = (*env)->NewIntArray(env, 4);
+    if (ints) {
+        (*env)->SetIntArrayRegion(env, ints, 0, 4, int_values);
+        (*env)->GetIntArrayRegion(env, ints, 0, 4, int_region);
+        jboolean is_copy = JNI_FALSE;
+        jint *elements = (*env)->GetIntArrayElements(env, ints, &is_copy);
+        if (elements) (*env)->ReleaseIntArrayElements(env, ints, elements, JNI_ABORT);
+        jint *critical = (jint *) (*env)->GetPrimitiveArrayCritical(env, ints, &is_copy);
+        if (critical) (*env)->ReleasePrimitiveArrayCritical(env, ints, critical, JNI_ABORT);
+        checksum ^= int_region[0] + int_region[3];
+    }
+    jbyte bytes[4] = {1, 2, 3, 4};
+    jbyte byte_region[4] = {0, 0, 0, 0};
+    jbyteArray byte_array = (*env)->NewByteArray(env, 4);
+    if (byte_array) {
+        (*env)->SetByteArrayRegion(env, byte_array, 0, 4, bytes);
+        (*env)->GetByteArrayRegion(env, byte_array, 0, 4, byte_region);
+        jboolean is_copy = JNI_FALSE;
+        jbyte *elements = (*env)->GetByteArrayElements(env, byte_array, &is_copy);
+        if (elements) (*env)->ReleaseByteArrayElements(env, byte_array, elements, JNI_ABORT);
+    }
+    jbooleanArray booleans = (*env)->NewBooleanArray(env, 2);
+    if (booleans) {
+        jboolean values[2] = {JNI_TRUE, JNI_FALSE};
+        (*env)->SetBooleanArrayRegion(env, booleans, 0, 2, values);
+        jboolean is_copy = JNI_FALSE;
+        jboolean *elements = (*env)->GetBooleanArrayElements(env, booleans, &is_copy);
+        if (elements) (*env)->ReleaseBooleanArrayElements(env, booleans, elements, JNI_ABORT);
+    }
+    jobjectArray objects = (*env)->NewObjectArray(env, 2, string_class, text);
+    if (objects) {
+        (*env)->SetObjectArrayElement(env, objects, 0, utf16);
+        checksum ^= (jlong) (*env)->GetObjectArrayElement(env, objects, 0);
+    }
+
+    jobject global = text ? (*env)->NewGlobalRef(env, text) : NULL;
+    jobject local = text ? (*env)->NewLocalRef(env, text) : NULL;
+    jweak weak = text ? (*env)->NewWeakGlobalRef(env, text) : NULL;
+    checksum ^= (*env)->IsSameObject(env, text, local);
+    checksum ^= (jlong) (*env)->GetObjectRefType(env, weak);
+    if (probe_object) {
+        (*env)->MonitorEnter(env, probe_object);
+        (*env)->MonitorExit(env, probe_object);
+    }
+    JavaVM *vm = NULL;
+    (*env)->GetJavaVM(env, &vm);
+    unsigned char direct_memory[32];
+    memset(direct_memory, 0x5a, sizeof(direct_memory));
+    jobject direct = (*env)->NewDirectByteBuffer(env, direct_memory, sizeof(direct_memory));
+    if (direct) {
+        checksum ^= (jlong) (*env)->GetDirectBufferAddress(env, direct);
+        checksum ^= (*env)->GetDirectBufferCapacity(env, direct);
+    }
+
+    jclass error_class = (*env)->FindClass(env, "java/lang/IllegalArgumentException");
+    if (error_class) {
+        (*env)->ThrowNew(env, error_class, "rustfrida JNI exercise (cleared)");
+        (*env)->ExceptionOccurred(env);
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionCheck(env);
+        (*env)->ExceptionClear(env);
+    }
+    if (global) (*env)->DeleteGlobalRef(env, global);
+    if (weak) (*env)->DeleteWeakGlobalRef(env, weak);
+    if (local) (*env)->DeleteLocalRef(env, local);
+    (*env)->PopLocalFrame(env, NULL);
+    return checksum;
 }
 
 /*
@@ -432,6 +668,7 @@ static void *rf_kpm_probe_thread(void *opaque) {
 
 static unsigned long long rf_maps_target_inode(const char *maps) {
     const char *line = maps;
+    unsigned long long demo_inode = 0;
     while (line && *line) {
         const char *end = strchr(line, '\n');
         size_t length = end ? (size_t) (end - line) : strlen(line);
@@ -442,18 +679,21 @@ static unsigned long long rf_maps_target_inode(const char *maps) {
             char perms[8];
             memcpy(copy, line, length);
             copy[length] = '\0';
-            if ((strstr(copy, "rfcompat-mkpm-map") != NULL ||
-                 strstr(copy, "libcompatdemo.so") != NULL) &&
-                sscanf(copy, "%llx-%llx %7s %llx %x:%x %llu",
+            if (sscanf(copy, "%llx-%llx %7s %llx %x:%x %llu",
                        &start, &finish, perms, &offset,
                        &dev_major, &dev_minor, &inode) == 7) {
-                return inode;
+                /* 优先返回 runner 创建的测试 VMA；否则先遇到的
+                 * libcompatdemo.so 会把真正的 emaps 结果遮住。 */
+                if (strstr(copy, "rfcompat-mkpm-map") != NULL)
+                    return inode;
+                if (demo_inode == 0 && strstr(copy, "libcompatdemo.so") != NULL)
+                    demo_inode = inode;
             }
         }
         if (!end) break;
         line = end + 1;
     }
-    return 0;
+    return demo_inode;
 }
 
 static uintptr_t rf_module_base(void *address, const char **path_out) {
@@ -564,6 +804,7 @@ Java_com_rustfrida_compatdemo_Native_nativeCounters(JNIEnv *env, jclass clazz) {
                    "\"jni_register_attempts\":%" PRIu64 ","
                    "\"jni_register_successes\":%" PRIu64 ","
                    "\"jni_probe_tick\":%" PRIu64 ",\"jni_probe_object\":%" PRIu64 ","
+                   "\"jni_probe_exercise\":%" PRIu64 ","
                    "\"java_oncreate\":%" PRIu64 ",\"dex_load\":%" PRIu64 ","
                    "\"dex_payload\":%" PRIu64 "}",
                    rf_svc_total(), rf_count_load(&g_object_step_calls),
@@ -598,6 +839,7 @@ Java_com_rustfrida_compatdemo_Native_nativeCounters(JNIEnv *env, jclass clazz) {
                    rf_count_load(&g_soft_target_calls[30]), rf_count_load(&g_soft_target_calls[31]),
                    rf_count_load(&g_jni_register_attempts), rf_count_load(&g_jni_register_successes),
                    rf_count_load(&g_jni_probe_tick_calls), rf_count_load(&g_jni_probe_object_calls),
+                   rf_count_load(&g_jni_probe_exercise_calls),
                    rf_count_load(&g_java_oncreate_calls), rf_count_load(&g_dex_load_calls),
                    rf_count_load(&g_dex_payload_calls));
 }
@@ -673,6 +915,7 @@ Java_com_rustfrida_compatdemo_Native_nativeRegisterJniProbe(JNIEnv *env, jclass 
     JNINativeMethod methods[] = {
         {"probeTick", "(J)J", (void *) rf_jni_probe_tick},
         {"probeObject", "(I)J", (void *) rf_jni_probe_object},
+        {"probeExercise", "(I)J", (void *) rf_jni_probe_exercise},
     };
     if ((*env)->RegisterNatives(env, probe, methods,
                                 (jint) (sizeof(methods) / sizeof(methods[0]))) != 0) {
@@ -711,9 +954,11 @@ Java_com_rustfrida_compatdemo_Native_nativeJniProbeInfo(JNIEnv *env, jclass claz
     (void) clazz;
     return rf_json(env,
                    "{\"registered\":%d,\"probeTick\":\"0x%" PRIxPTR "\","
-                   "\"probeObject\":\"0x%" PRIxPTR "\"}",
+                   "\"probeObject\":\"0x%" PRIxPTR "\","
+                   "\"probeExercise\":\"0x%" PRIxPTR "\"}",
                    __atomic_load_n(&g_jni_probe_registered, __ATOMIC_ACQUIRE),
-                   (uintptr_t) rf_jni_probe_tick, (uintptr_t) rf_jni_probe_object);
+                   (uintptr_t) rf_jni_probe_tick, (uintptr_t) rf_jni_probe_object,
+                   (uintptr_t) rf_jni_probe_exercise);
 }
 
 JNIEXPORT jstring JNICALL
@@ -849,7 +1094,7 @@ Java_com_rustfrida_compatdemo_Native_nativeKpmProbe(JNIEnv *env, jclass clazz) {
 
     jstring result = rf_json(env,
                    "{\"pid\":%ld,\"tid\":%ld,\"marker\":\"%s\","
-                   "\"open_marker\":%ld,\"read_marker\":%ld,"
+                   "\"open_marker\":%ld,\"read_marker\":%ld,\"marker_data\":\"%s\","
                    "\"open_version\":%ld,\"read_version\":%ld,"
                    "\"readlink_path\":\"%s\",\"readlink_rc\":%ld,\"readlink_target\":\"%s\","
                    "\"boot_time_rc\":%ld,\"boot_time_ns\":%lld,"
@@ -861,7 +1106,7 @@ Java_com_rustfrida_compatdemo_Native_nativeKpmProbe(JNIEnv *env, jclass clazz) {
                    "\"thread_create\":%d,\"thread_tid\":%ld,"
                    "\"thread_open_marker\":%ld,\"thread_read_marker\":%ld}",
                    rf_getpid(), rf_gettid(), RF_KPM_MARKER,
-                   marker_fd, marker_read, version_open, version_read,
+                   marker_fd, marker_read, marker_data, version_open, version_read,
                    RF_KPM_READLINK_PATH, readlink_rc, readlink_target,
                    boot_time_rc, boot_time_ns,
                    invalid_write, socket_fd, connect_rc, send_rc, recv_rc,

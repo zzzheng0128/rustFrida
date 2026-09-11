@@ -8,8 +8,17 @@ package com.rustfrida.compatdemo;
  * 直接观察真实的 JNI 注册表和函数指针。
  */
 public final class JniProbe {
+    // 这些字段和构造函数只为 native JNI exercise 提供稳定的反射/字段目标。
+    // 它们不是业务状态，改变后不会影响其他实验通道。
+    public int exerciseInt;
+    public Object exerciseObject;
+    public static int exerciseStaticInt;
+    public static Object exerciseStaticObject;
+
     public static native long probeTick(long seed);
     public static native long probeObject(int loops);
+    /** 主动调用一组 JNI 1.6 表槽，便于 jnitrace 模式验证实际命中。 */
+    public static native long probeExercise(int rounds);
 
-    private JniProbe() {}
+    public JniProbe() {}
 }

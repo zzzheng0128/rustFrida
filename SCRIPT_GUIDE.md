@@ -12,7 +12,7 @@
 | `01_native_hook.js` | `Interceptor.attach` 观察 native 导出 |
 | `02_java_hook.js` | `Java.ready` + `Java.use` 观察 Java 方法 |
 | `03_kernel_trace.js` | `KT>` uprobe/HWBP 控制和事件摘要 |
-| `04_jni_trace.js` | `Jni.addr("RegisterNatives")` 观察 JNI 注册 |
+| `04_jni_trace.js` | JNIEnv 函数表系统 JNI 追踪（类/方法/字段/字符串/数组/注册等） |
 | `05_memory_probe.js` | 只读模块内存并输出十六进制 |
 | `06_agent_replace.js` | `hook()` 替换式 native hook |
 | `07_gumtrace.js` | GumTrace 指令级追踪；默认目标为兼容性 demo |
@@ -44,6 +44,75 @@ adb shell 'su -c "(sleep 60; echo exit) | timeout 65 \
 ```
 
 spawn 的非交互 stdin 必须保活。stdin 直接 EOF 会让 REPL 退出并清理 hook；只看到 `loaded`、没有命中时先检查这一点。
+
+## 换成其他应用时要传什么
+
+`examples/rustfrida-compat-app/run_demo_spawn.sh` 是自包含的兼容性 demo 运行器，固定使用
+`com.rustfrida.compatdemo`、`libcompatdemo.so` 以及 demo 自己的 Java/native 计数器。换成
+其他应用时不要只把 `--spawn` 后的包名替换掉；请复制一个模板脚本，或者直接使用下面的
+通用命令，并替换目标配置。
+
+| 项目 | 必须提供的值 | 在脚本中的位置 |
+| --- | --- | --- |
+| 进程 | 包名，例如 `com.example.app` | `--spawn`（启动前注入）或 `--name`/`--pid`（已运行进程） |
+| 脚本 | 推送到设备的 JS 路径 | `-l /data/local/tmp/app.js` |
+| native 导出 | ELF 名和导出符号 | `TARGET_MODULE`、`TARGET_SYMBOL` |
+| native 偏移 | 当前 APK/ABI 的模块相对偏移 | `TARGET_OFFSET` 或 `KT>x/KT>r/KT>w` |
+| Java | 完整类名、方法名、重载签名 | `TARGET_CLASS`、`TARGET_METHOD`、`TARGET_OVERLOAD` |
+| JNI | `RegisterNatives` 地址和目标 ABI | `04_jni_trace.js` 中的 `Jni.addr` 与结构体读取 |
+| GumTrace | 目标模块、符号或偏移、输出文件 | `TARGET_MODULE`、`TARGET_SYMBOL`/`TARGET_OFFSET`、`TRACE_FILE` |
+| KPM（可选） | 已加载的模块名、superkey/KP 版本、目标 UID 和测试路径 | `13_kpm_control.js` 的配置；开关不要放进高频回调 |
+
+一个只观察 native 导出的新应用示例：
+
+```bash
+adb push examples/templates/01_native_hook.js /data/local/tmp/app.js
+adb shell 'su -c "(sleep 60; echo exit) | timeout 70 \
+  /data/local/tmp/rustfrida --spawn com.example.app \
+  -l /data/local/tmp/app.js"'
+```
+
+一个需要 uprobe/HWBP 的新应用示例：
+
+```bash
+adb push my_app_trace.js /data/local/tmp/my_app_trace.js
+adb shell 'su -c "(sleep 120; echo exit) | timeout 135 \
+  /data/local/tmp/rustfrida --spawn com.example.app --mode=hybrid \
+  -l /data/local/tmp/my_app_trace.js \
+  --trace-lib libfoo.so --trace-lib-only --trace-disable-syscall \
+  --trace-no-stack --trace-output /data/local/tmp/my_app.jsonl"'
+```
+
+JS 中至少要把这些 demo 值替换成目标应用的值：
+
+```js
+var TARGET_MODULE = "libfoo.so";
+var TARGET_SYMBOL = "foo_entry"; // 有导出符号时使用
+var TARGET_OFFSET = null;         // 没有导出符号时填当前版本的 0x 偏移
+
+// 只在确认模块已经加载、且偏移属于当前 arm64 ELF 后下断点。
+console.log("KT>sub");
+console.log("KT>brk libfoo.so 0x1234");       // uprobe
+console.log("KT>x libfoo.so+0x1234");         // 执行 HWBP
+console.log("KT>rw libfoo.so+0x5678 8");      // 读写观察点
+```
+
+偏移必须从当前 APK 中的 arm64 `libfoo.so` 重新计算，例如用 `readelf -Ws`、`nm -D`
+或 `llvm-objdump -d`；不能沿用 `libcompatdemo.so` 的偏移。`KT>x`、`KT>r/w/rw` 使用
+模块基址加偏移，运行时会处理 ASLR；如果直接写绝对地址，该地址必须来自本轮进程的
+`Process.findModuleByName(...).base`，不能从上一次运行复制。
+
+通用脚本不需要手工传 UID：`--spawn`/`--name` 已经确定了注入目标，hybrid 的内核过滤
+会按目标进程归属处理。只有纯 `--mode=trace`、同 UID 有多个进程，或需要排除其他进程时，
+才显式加 `--trace-pid <pid>` 或 `--trace-uid <uid>`。SVC 过滤可用
+`--trace-lib <so>` + `--trace-lib-only`，这只按调用 LR 所属模块过滤，不会自动安装
+uprobe/HWBP；断点仍要由 JS 输出 `KT>` 命令。
+
+换应用后的成功判定也要改为目标自身的标志：看到 `attached/installed/armed` 只说明
+安装成功，还必须看到对应 `c#`、Java 命中、`uprobe.hit` 或 `hwbp.hit`。兼容性 demo
+里的 `nativeCounters()`、`sourceBaseline` 和 `com.rustfrida.compatdemo.*` 不适用于别的
+应用；如果需要“源端触发数和观察端数”对账，要在目标测试 app 中增加自己的原子计数器，
+或只使用 host 的 JSONL 事件统计。
 
 ## QuickJS 兼容规则
 
@@ -90,7 +159,14 @@ if (m) {
 }
 ```
 
-JNI 注册观察使用 `04_jni_trace.js`。`Jni.addr("RegisterNatives")` 也必须在 `Java.ready` 内调用；注册表解析失败时先降低一次读取数量，再检查 `JNINativeMethod` 布局和目标 ABI。
+JNI 系统调用观察使用 `04_jni_trace.js`。模板从 `Jni.addr(name)` 解析当前线程
+`JNIEnv->functions` 表中的常用槽位，覆盖 `FindClass`、`GetMethodID`、字段读写、
+`Call*MethodA`、字符串/数组、异常、`RegisterNatives`、引用管理和
+`DirectByteBuffer`。兼容 demo 的 `JniProbe.probeExercise()` 会主动触发这些路径，方便
+先确认“已安装”再确认“有命中”。所有 `Jni.addr(...)` 都必须在 `Java.ready` 内调用；spawn 时
+只看到脚本加载而没有 `table hooks installed`，先检查 Java worker 是否 ready。
+`RegisterNatives` 的方法表按 `JNINativeMethod{name, signature, fnPtr}` 解析；如果
+目标 ART 对某个槽位没有实现，模板会记录 `unavailable` 并继续安装其他槽位。
 
 ## KT> 桥
 

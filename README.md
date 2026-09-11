@@ -3,6 +3,10 @@
 ARM64 Android 动态插桩和内核事件观察工具。首页只保留日常入口；历史实验脚本和
 `doc/` 专项资料保留，不需要时可以跳过。
 
+当前兼容性结论只采信 Pixel 6（serial `18201FDF6002GR`，Android 15、内核
+`6.1.99-android14-11-gd6f926cfde54-ab12786694`）。Pixel 5（serial
+`0A291FDD40011F`，4.19）属于另一组实验，旧日志不与 Pixel 6 合并。
+
 ## 最快跑通兼容性 demo
 
 在仓库根目录执行：
@@ -18,7 +22,8 @@ bash examples/rustfrida-compat-app/build_demo.sh
 bash .build-android.sh rust_frida
 
 # 安装 APK、spawn 注入并运行 60 秒（默认全部通道、低频可读档）
-RUN_SECS=60 BUILD_RF=0 bash examples/rustfrida-compat-app/run_demo_spawn.sh 0
+DEVICE_SERIAL=18201FDF6002GR RUN_SECS=60 BUILD_RF=0 \
+  bash examples/rustfrida-compat-app/run_demo_spawn.sh 0
 
 # 也可以让新手按菜单选择，或直接组合编号/名称
 bash examples/rustfrida-compat-app/run_demo_spawn.sh       # 交互菜单
@@ -78,6 +83,11 @@ runs/compat-demo/<时间戳>/
 | 查看文档分类 | [DOCS.md](DOCS.md) |
 
 ## 通用运行方式
+
+换成自己的应用时，不要直接修改兼容性 demo 的包名就运行。`run_demo_spawn.sh` 还依赖
+demo 的 `Native.nativeInfo()`、`libcompatdemo.so` 和源端计数器；其他应用请按
+[脚本适配清单](SCRIPT_GUIDE.md#换成其他应用时要传什么) 替换包名、脚本、模块/符号或偏移、
+Java/JNI 配置，再用下面的通用命令启动。
 
 先构建并推送二进制：
 

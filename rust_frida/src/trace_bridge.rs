@@ -110,6 +110,9 @@ struct CallbackState {
     hwbp_critical_stalled_id: Option<u64>,
     hwbp_write_in_flight: [Option<InFlightCallback>; 4],
     hwbp_write_stalled_id: [Option<u64>; 4],
+    // 每个写观察点地址最多占一个 reservation。否则高频对象写入会把
+    // 4 个槽位全部占满，method_slot 的控制事件永远进不了 JS。
+    hwbp_write_keys: [u64; 4],
     next_id: u64,
 }
 
@@ -134,6 +137,7 @@ impl CallbackState {
             hwbp_critical_stalled_id: None,
             hwbp_write_in_flight: [None; 4],
             hwbp_write_stalled_id: [None; 4],
+            hwbp_write_keys: [0; 4],
             next_id: 1,
         }
     }
@@ -217,6 +221,7 @@ impl CallbackState {
         now: Instant,
         critical: bool,
         write: bool,
+        write_key: u64,
     ) -> Option<u64> {
         if !subscribed {
             return None;
@@ -235,14 +240,39 @@ impl CallbackState {
                     }
                 }
             }
-            let Some(slot) = (0..self.hwbp_write_in_flight.len())
-                .find(|&slot| self.hwbp_write_stalled_id[slot].is_none() && self.hwbp_write_in_flight[slot].is_none())
-            else {
+            // Reuse the slot assigned to this address when present. A new
+            // address gets a fresh slot; at most four distinct addresses are
+            // admitted concurrently, preserving the old bounded behavior.
+            let slot = if write_key != 0 {
+                if let Some(existing) = self.hwbp_write_keys.iter().position(|key| *key == write_key) {
+                    if self.hwbp_write_stalled_id[existing].is_some() || self.hwbp_write_in_flight[existing].is_some() {
+                        return {
+                            self.stats.hwbp_limited = self.stats.hwbp_limited.saturating_add(1);
+                            None
+                        };
+                    }
+                    Some(existing)
+                } else {
+                    (0..self.hwbp_write_in_flight.len()).find(|&slot| {
+                        self.hwbp_write_keys[slot] == 0
+                            && self.hwbp_write_stalled_id[slot].is_none()
+                            && self.hwbp_write_in_flight[slot].is_none()
+                    })
+                }
+            } else {
+                (0..self.hwbp_write_in_flight.len()).find(|&slot| {
+                    self.hwbp_write_stalled_id[slot].is_none() && self.hwbp_write_in_flight[slot].is_none()
+                })
+            };
+            let Some(slot) = slot else {
                 self.stats.hwbp_limited = self.stats.hwbp_limited.saturating_add(1);
                 return None;
             };
             let id = self.next_id;
             self.next_id = self.next_id.wrapping_add(1).max(1);
+            if write_key != 0 {
+                self.hwbp_write_keys[slot] = write_key;
+            }
             self.hwbp_write_in_flight[slot] = Some(InFlightCallback { id, started_at: now });
             return Some(id);
         }
@@ -297,6 +327,7 @@ impl CallbackState {
             for slot in 0..self.hwbp_write_in_flight.len() {
                 if self.hwbp_write_in_flight[slot].is_some_and(|in_flight| in_flight.id == id) {
                     self.hwbp_write_in_flight[slot] = None;
+                    self.hwbp_write_keys[slot] = 0;
                     break;
                 }
             }
@@ -349,9 +380,11 @@ impl CallbackState {
         for slot in 0..self.hwbp_write_in_flight.len() {
             if self.hwbp_write_in_flight[slot].is_some_and(|in_flight| in_flight.id == id) {
                 self.hwbp_write_in_flight[slot] = None;
+                self.hwbp_write_keys[slot] = 0;
             }
             if self.hwbp_write_stalled_id[slot] == Some(id) {
                 self.hwbp_write_stalled_id[slot] = None;
+                self.hwbp_write_keys[slot] = 0;
             }
         }
     }
@@ -368,6 +401,7 @@ impl CallbackState {
         self.hwbp_critical_stalled_id = None;
         self.hwbp_write_in_flight = [None; 4];
         self.hwbp_write_stalled_id = [None; 4];
+        self.hwbp_write_keys = [0; 4];
         self.svc = CallbackBucket::new(SVC_CALLBACKS_PER_SECOND, now);
         self.uprobe = CallbackBucket::new(UPROBE_CALLBACKS_PER_SECOND, now);
         self.hwbp = CallbackBucket::new(HWBP_CALLBACKS_PER_SECOND, now);
@@ -385,6 +419,7 @@ impl CallbackState {
         self.hwbp_critical_stalled_id = None;
         self.hwbp_write_in_flight = [None; 4];
         self.hwbp_write_stalled_id = [None; 4];
+        self.hwbp_write_keys = [0; 4];
     }
 }
 
@@ -493,6 +528,23 @@ pub(crate) fn push_hwbp_event_jsonl(jsonl: &str) {
     push_event_jsonl_inner(jsonl, false, true);
 }
 
+/// Extract the write-watchpoint address from the compact callback JSON. The
+/// callback serializer emits `bp.kind` before `bp.addr`; malformed/legacy
+/// records simply use key=0 and retain the bounded first-free behavior.
+fn hwbp_write_key(jsonl: &str) -> u64 {
+    let Some(bp) = jsonl.split_once("\"bp\":").map(|(_, value)| value) else {
+        return 0;
+    };
+    if !bp.starts_with("{\"kind\":\"w\"") {
+        return 0;
+    }
+    let Some((_, tail)) = bp.split_once("\"addr\":\"0x") else {
+        return 0;
+    };
+    let end = tail.find('"').unwrap_or(tail.len());
+    u64::from_str_radix(&tail[..end], 16).unwrap_or(0)
+}
+
 fn push_event_jsonl_inner(jsonl: &str, syscall: bool, hwbp: bool) {
     let subscribed = js_subscribed();
     if !subscribed {
@@ -503,8 +555,9 @@ fn push_event_jsonl_inner(jsonl: &str, syscall: bool, hwbp: bool) {
     let write = hwbp && jsonl.contains("\"bp\":{\"kind\":\"w\"");
     let callback_id = {
         let mut state = callback_state();
+        let write_key = if write { hwbp_write_key(jsonl) } else { 0 };
         if hwbp {
-            state.admit_hwbp(subscribed, sender.is_some(), Instant::now(), critical, write)
+            state.admit_hwbp(subscribed, sender.is_some(), Instant::now(), critical, write, write_key)
         } else {
             state.admit(syscall, subscribed, sender.is_some(), Instant::now())
         }
@@ -715,8 +768,8 @@ mod tests {
     fn critical_watchpoint_has_a_reservation_independent_of_execute_hit() {
         let start = Instant::now();
         let mut state = CallbackState::new(start);
-        let execute = state.admit_hwbp(true, true, start, false, false).unwrap();
-        let watch = state.admit_hwbp(true, true, start, true, false).unwrap();
+        let execute = state.admit_hwbp(true, true, start, false, false, 0).unwrap();
+        let watch = state.admit_hwbp(true, true, start, true, false, 0).unwrap();
         assert_ne!(execute, watch);
         assert!(state.hwbp_in_flight.is_some());
         assert!(state.hwbp_critical_in_flight.is_some());
@@ -731,12 +784,29 @@ mod tests {
         let start = Instant::now();
         let mut state = CallbackState::new(start);
         let ids: Vec<_> = (0..4)
-            .map(|_| state.admit_hwbp(true, true, start, true, true).unwrap())
+            .map(|_| state.admit_hwbp(true, true, start, true, true, 0).unwrap())
             .collect();
-        assert!(state.admit_hwbp(true, true, start, true, true).is_none());
+        assert!(state.admit_hwbp(true, true, start, true, true, 0).is_none());
         for id in ids {
             state.complete(id);
         }
-        assert!(state.admit_hwbp(true, true, start, true, true).is_some());
+        assert!(state.admit_hwbp(true, true, start, true, true, 0).is_some());
+    }
+
+    #[test]
+    fn write_watchpoints_are_fair_across_addresses() {
+        let start = Instant::now();
+        let mut state = CallbackState::new(start);
+        let first = state.admit_hwbp(true, true, start, true, true, 0x1000).unwrap();
+        // A second event for the same address cannot consume another slot.
+        assert!(state.admit_hwbp(true, true, start, true, true, 0x1000).is_none());
+        // Other watchpoint addresses still get their own reservations.
+        let second = state.admit_hwbp(true, true, start, true, true, 0x2000).unwrap();
+        let third = state.admit_hwbp(true, true, start, true, true, 0x3000).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        state.complete(first);
+        state.complete(second);
+        state.complete(third);
     }
 }

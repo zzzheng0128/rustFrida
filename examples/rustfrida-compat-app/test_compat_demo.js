@@ -7,7 +7,7 @@
 
 var counts = { java: 0, c: 0, dex: 0, dexPayload: 0, method: 0,
     svc: 0, uprobe: 0, hwbp: 0, jni: 0, jniRegister: 0, jniCall: 0,
-    gum: 0, other: 0 };
+    jniSystem: 0, gum: 0, other: 0 };
 var info = null;
 var nativeApi = null;
 var methodSlot = null;
@@ -154,7 +154,8 @@ function verificationSnapshot(force) {
         dex: counterDelta(now, sourceBaseline, 'dex_load'),
         dexPayload: counterDelta(now, sourceBaseline, 'dex_payload'),
         jni: counterDelta(now, sourceBaseline, 'jni_probe_tick') +
-            counterDelta(now, sourceBaseline, 'jni_probe_object'),
+            counterDelta(now, sourceBaseline, 'jni_probe_object') +
+            counterDelta(now, sourceBaseline, 'jni_probe_exercise'),
         jni_register: setupJniRegisters +
             counterDelta(now, sourceBaseline, 'jni_register_successes')
     };
@@ -206,6 +207,7 @@ function verificationSnapshot(force) {
         hwbp: observedDelta('hwbp'), c: observedDelta('c'),
         java: observedDelta('java'), dex: observedDelta('dex'),
         dexPayload: observedDelta('dexPayload'), jni: observedDelta('jniCall'),
+        jniSystem: observedDelta('jniSystem'),
         jniRegister: Math.max(observedDelta('jniRegister'), jniRegisteredState),
         method: observedDelta('method')
     };
@@ -280,6 +282,7 @@ function verificationSnapshot(force) {
         ' source_dex=' + source.dex + ' observed_dex=' + observed.dex +
         ' source_dexPayload=' + source.dexPayload + ' observed_dexPayload=' + observed.dexPayload +
         ' source_jni=' + source.jni + ' observed_jni=' + observed.jni +
+        ' observed_jni_system=' + observed.jniSystem +
         ' source_jni_register=' + source.jni_register + ' observed_jni_register=' + observed.jniRegister +
         ' source_method=' + source.method_calls + ' observed_method=' + observed.method +
         ' missing=' + JSON.stringify(missing) +
@@ -733,12 +736,181 @@ function installGumTrace() {
 
 function installJniTrace(Native) {
     try {
+        // recovered-scripts/test_spawn_jnitrace.js 追踪的是 JNIEnv 函数表，
+        // 而不是某个应用自定义的 JNI 方法。这里沿用相同的表解析方式，
+        // 扩展到 93 个常用 JNI 1.6 槽位：覆盖类/方法/字段、对象引用、
+        // Call*MethodA、字符串/数组、异常、RegisterNatives、同步和
+        // DirectByteBuffer。每个槽位只打印前 5 次和每 200 次一条，避免
+        // 系统 JNI 调用把 demo 日志刷满。
+        var systemSlots = [
+            // JNI 1.6 的函数表槽位。这里覆盖类/方法/字段解析、对象引用、
+            // Java 调用、字符串/数组、异常、注册和 DirectByteBuffer 等
+            // 常见路径；不只观察 RegisterNatives。
+            { slot: 4, name: 'GetVersion', detail: 'none' },
+            { slot: 5, name: 'DefineClass', detail: 'cstr1' },
+            { slot: 6, name: 'FindClass', detail: 'cstr1' },
+            { slot: 7, name: 'FromReflectedMethod', detail: 'ref1' },
+            { slot: 8, name: 'FromReflectedField', detail: 'ref1' },
+            { slot: 10, name: 'GetSuperclass', detail: 'ref1' },
+            { slot: 11, name: 'IsAssignableFrom', detail: 'ref2' },
+            { slot: 13, name: 'Throw', detail: 'ref1' },
+            { slot: 14, name: 'ThrowNew', detail: 'thrownew' },
+            { slot: 15, name: 'ExceptionOccurred', detail: 'none' },
+            { slot: 16, name: 'ExceptionDescribe', detail: 'none' },
+            { slot: 17, name: 'ExceptionClear', detail: 'none' },
+            { slot: 19, name: 'PushLocalFrame', detail: 'int1' },
+            { slot: 20, name: 'PopLocalFrame', detail: 'ref1' },
+            { slot: 21, name: 'NewGlobalRef', detail: 'ref1' },
+            { slot: 22, name: 'DeleteGlobalRef', detail: 'ref1' },
+            { slot: 23, name: 'DeleteLocalRef', detail: 'ref1' },
+            { slot: 24, name: 'IsSameObject', detail: 'ref2' },
+            { slot: 25, name: 'NewLocalRef', detail: 'ref1' },
+            { slot: 26, name: 'EnsureLocalCapacity', detail: 'int1' },
+            { slot: 27, name: 'AllocObject', detail: 'ref1' },
+            { slot: 30, name: 'NewObjectA', detail: 'call' },
+            { slot: 31, name: 'GetObjectClass', detail: 'ref1' },
+            { slot: 32, name: 'IsInstanceOf', detail: 'ref2' },
+            { slot: 33, name: 'GetMethodID', detail: 'cstr2' },
+            { slot: 36, name: 'CallObjectMethodA', detail: 'call' },
+            { slot: 39, name: 'CallBooleanMethodA', detail: 'call' },
+            { slot: 51, name: 'CallIntMethodA', detail: 'call' },
+            { slot: 54, name: 'CallLongMethodA', detail: 'call' },
+            { slot: 63, name: 'CallVoidMethodA', detail: 'call' },
+            { slot: 66, name: 'CallNonvirtualObjectMethodA', detail: 'call' },
+            { slot: 81, name: 'CallNonvirtualIntMethodA', detail: 'call' },
+            { slot: 93, name: 'CallNonvirtualVoidMethodA', detail: 'call' },
+            { slot: 94, name: 'GetFieldID', detail: 'cstr2' },
+            { slot: 95, name: 'GetObjectField', detail: 'ref1' },
+            { slot: 100, name: 'GetIntField', detail: 'ref1' },
+            { slot: 104, name: 'SetObjectField', detail: 'ref1' },
+            { slot: 109, name: 'SetIntField', detail: 'ref1' },
+            { slot: 113, name: 'GetStaticMethodID', detail: 'cstr2' },
+            { slot: 116, name: 'CallStaticObjectMethodA', detail: 'call' },
+            { slot: 119, name: 'CallStaticBooleanMethodA', detail: 'call' },
+            { slot: 131, name: 'CallStaticIntMethodA', detail: 'call' },
+            { slot: 134, name: 'CallStaticLongMethodA', detail: 'call' },
+            { slot: 143, name: 'CallStaticVoidMethodA', detail: 'call' },
+            { slot: 144, name: 'GetStaticFieldID', detail: 'cstr2' },
+            { slot: 145, name: 'GetStaticObjectField', detail: 'ref1' },
+            { slot: 150, name: 'GetStaticIntField', detail: 'ref1' },
+            { slot: 154, name: 'SetStaticObjectField', detail: 'ref1' },
+            { slot: 159, name: 'SetStaticIntField', detail: 'ref1' },
+            { slot: 163, name: 'NewString', detail: 'none' },
+            { slot: 164, name: 'GetStringLength', detail: 'ref1' },
+            { slot: 165, name: 'GetStringChars', detail: 'ref1' },
+            { slot: 166, name: 'ReleaseStringChars', detail: 'ref1' },
+            { slot: 167, name: 'NewStringUTF', detail: 'cstr1' },
+            { slot: 168, name: 'GetStringUTFLength', detail: 'ref1' },
+            { slot: 169, name: 'GetStringUTFChars', detail: 'ref1' },
+            { slot: 170, name: 'ReleaseStringUTFChars', detail: 'ref1' },
+            { slot: 171, name: 'GetArrayLength', detail: 'ref1' },
+            { slot: 172, name: 'NewObjectArray', detail: 'array' },
+            { slot: 173, name: 'GetObjectArrayElement', detail: 'ref1' },
+            { slot: 174, name: 'SetObjectArrayElement', detail: 'ref1' },
+            { slot: 175, name: 'NewBooleanArray', detail: 'int1' },
+            { slot: 177, name: 'NewByteArray', detail: 'int1' },
+            { slot: 179, name: 'NewIntArray', detail: 'int1' },
+            { slot: 183, name: 'GetBooleanArrayElements', detail: 'ref1' },
+            { slot: 184, name: 'GetByteArrayElements', detail: 'ref1' },
+            { slot: 187, name: 'GetIntArrayElements', detail: 'ref1' },
+            { slot: 191, name: 'ReleaseBooleanArrayElements', detail: 'ref1' },
+            { slot: 192, name: 'ReleaseByteArrayElements', detail: 'ref1' },
+            { slot: 195, name: 'ReleaseIntArrayElements', detail: 'ref1' },
+            { slot: 199, name: 'GetBooleanArrayRegion', detail: 'ref1' },
+            { slot: 200, name: 'GetByteArrayRegion', detail: 'ref1' },
+            { slot: 203, name: 'GetIntArrayRegion', detail: 'ref1' },
+            { slot: 207, name: 'SetBooleanArrayRegion', detail: 'ref1' },
+            { slot: 208, name: 'SetByteArrayRegion', detail: 'ref1' },
+            { slot: 211, name: 'SetIntArrayRegion', detail: 'ref1' },
+            { slot: 215, name: 'RegisterNatives', detail: 'register' },
+            { slot: 216, name: 'UnregisterNatives', detail: 'ref1' },
+            { slot: 217, name: 'MonitorEnter', detail: 'ref1' },
+            { slot: 218, name: 'MonitorExit', detail: 'ref1' },
+            { slot: 219, name: 'GetJavaVM', detail: 'none' },
+            { slot: 220, name: 'GetStringRegion', detail: 'ref1' },
+            { slot: 221, name: 'GetStringUTFRegion', detail: 'ref1' },
+            { slot: 222, name: 'GetPrimitiveArrayCritical', detail: 'ref1' },
+            { slot: 224, name: 'GetStringCritical', detail: 'ref1' },
+            { slot: 225, name: 'ReleaseStringCritical', detail: 'ref1' },
+            { slot: 226, name: 'NewWeakGlobalRef', detail: 'ref1' },
+            { slot: 227, name: 'DeleteWeakGlobalRef', detail: 'ref1' },
+            { slot: 228, name: 'ExceptionCheck', detail: 'none' },
+            { slot: 229, name: 'NewDirectByteBuffer', detail: 'none' },
+            { slot: 230, name: 'GetDirectBufferAddress', detail: 'ref1' },
+            { slot: 231, name: 'GetDirectBufferCapacity', detail: 'ref1' },
+            { slot: 232, name: 'GetObjectRefType', detail: 'ref1' }
+        ];
+        var systemHookedAddresses = Object.create(null);
+        var systemHooked = 0;
+        function readJniCString(value) {
+            try { return ptr(value).readCString(); } catch (_) { return '<unreadable>'; }
+        }
+        function systemDetail(slot, args) {
+            try {
+                if (slot.detail === 'cstr1') return " '" + readJniCString(args[1]) + "'";
+                if (slot.detail === 'cstr2') {
+                    return " name='" + readJniCString(args[2]) +
+                        "' sig='" + readJniCString(args[3]) + "'";
+                }
+                if (slot.detail === 'thrownew') {
+                    return " msg='" + readJniCString(args[2]) + "'";
+                }
+                if (slot.detail === 'int1') return ' value=' + Number(args[1]);
+                if (slot.detail === 'ref1') return ' ref=' + String(args[1] || '0x0');
+                if (slot.detail === 'ref2') return ' ref1=' + String(args[1] || '0x0') +
+                        ' ref2=' + String(args[2] || '0x0');
+                if (slot.detail === 'call') return ' obj=' + String(args[1] || '0x0') +
+                        ' method=' + String(args[2] || '0x0');
+                if (slot.detail === 'array') return ' len=' + Number(args[1]) +
+                        ' clazz=' + String(args[2] || '0x0');
+                if (slot.detail === 'register') {
+                    var firstName = '<none>';
+                    try { firstName = readJniCString(args[2].readPointer()); } catch (_) {}
+                    return ' count=' + Number(args[3]) + " first='" + firstName + "'";
+                }
+            } catch (_) {}
+            return '';
+        }
+        function installSystemSlot(slot, address) {
+            if (!validPtr(address)) {
+                log('[JNI-SYSTEM] ' + slot.name + ' address unavailable');
+                return false;
+            }
+            var addressKey = key(address);
+            // RegisterNatives 由下面的统一回调安装；避免和 recovered 版本
+            // 一样再次 attach 同一函数指针，导致每次注册打印两遍。
+            if (systemHookedAddresses[addressKey]) return false;
+            systemHookedAddresses[addressKey] = true;
+            var slotHits = 0;
+            try {
+                Interceptor.attach(address, {
+                    onEnter: function (args) {
+                        slotHits++;
+                        counts.jniSystem++;
+                        if (slotHits <= 5 || slotHits % 200 === 0) {
+                            log('[JNI-SYSTEM] ' + slot.name + ' #' + slotHits +
+                                systemDetail(slot, args));
+                        }
+                    }
+                });
+                systemHooked++;
+                log('[JNI-SYSTEM] hooked ' + slot.name + ' slot=' + slot.slot +
+                    ' at ' + address);
+                return true;
+            } catch (error) {
+                log('[JNI-SYSTEM] attach ' + slot.name + ' failed: ' +
+                    (error.message || error));
+                return false;
+            }
+        }
+
         // Java.use 的 native 调用由 app 线程执行；其 JNIEnv 表可能与 JS
         // worker 不同。先让同一个调用路径返回表槽地址，避免只 hook 到
         // worker 私有的 JNIEnv 表而漏掉真正的 RegisterNatives。
         var address = null;
         try { address = ptr(String(Native.nativeJniRegisterNativesAddress())); } catch (_) {}
         if (!validPtr(address)) address = Jni.addr('RegisterNatives');
+        var registerHookInstalled = false;
         var onRegister = function (env, clazz, methodPtr, nativeCount) {
             try {
                     var className = Jni.env.getClassName(clazz);
@@ -752,15 +924,51 @@ function installJniTrace(Native) {
                         log('  [jni] ' + method.name + ' ' + method.sig + ' -> ' + method.fnPtr);
                     }
             } catch (error) { log('JNI decode failed: ' + (error.message || error)); }
-            return this.$orig();
+            // hook() 回调有 $orig；老版本只有 Interceptor.attach 时没有。
+            // fallback 不改寄存器/返回值，只观察并让原函数自然返回。
+            if (this && typeof this.$orig === 'function') return this.$orig();
+            return undefined;
         };
         // JNIEnv 表槽在 ART 上是间接入口。hook() 走运行时的寄存器重编译
         // 路径，能覆盖 app 线程的表调用；老版本没有 hook 时再退回 attach。
-        if (typeof hook === 'function') hook(address, onRegister);
-        else Interceptor.attach(address, { onEnter: function (args) {
-            onRegister.call(this, args[0], args[1], args[2], args[3]);
-        }});
-        log('RegisterNatives hook installed at ' + address);
+        if (validPtr(address)) {
+            try {
+                if (typeof hook === 'function') hook(address, onRegister);
+                else Interceptor.attach(address, { onEnter: function (args) {
+                    onRegister.call(this, args[0], args[1], args[2], args[3]);
+                }});
+                registerHookInstalled = true;
+                log('RegisterNatives hook installed at ' + address);
+            } catch (error) {
+                log('RegisterNatives hook failed: ' + (error.message || error));
+            }
+        } else {
+            log('RegisterNatives address unavailable');
+        }
+
+        // RegisterNatives 已经由上面的 app-thread-aware 回调覆盖；如果当前
+        // Java worker 的 JNIEnv 表使用了不同的函数地址，再额外挂这一份表槽。
+        // 其余四个槽位直接从当前 Java worker 的 JNIEnv 表解析。Jni.addr()
+        // 的实现与 recovered-scripts 一致，适用于 spawn/attach 两种模式。
+        for (var si = 0; si < systemSlots.length; si++) {
+            var systemSlot = systemSlots[si];
+            var systemAddress = null;
+            try { systemAddress = Jni.addr(systemSlot.name); } catch (error) {
+                log('[JNI-SYSTEM] Jni.addr ' + systemSlot.name + ' failed: ' +
+                    (error.message || error));
+            }
+            if (registerHookInstalled && systemSlot.name === 'RegisterNatives' &&
+                    key(systemAddress) === key(address)) {
+                // 同一个地址已由 app-thread-aware hook 覆盖，避免重复 attach。
+                continue;
+            }
+            installSystemSlot(systemSlot, systemAddress);
+        }
+        log('[JNI-SYSTEM] table hooks installed=' +
+            (systemHooked + (registerHookInstalled ? 1 : 0)) +
+            '/' + systemSlots.length +
+            ' (RegisterNatives app-thread-aware=' + (registerHookInstalled ? 'yes' : 'no') + ')');
+
         // 在观察点安装以后再触发一次动态注册，确保 spawn 早期没有竞态漏报。
         if (Native.nativeRegisterJniProbe()) {
             log('JniProbe registration requested');
@@ -772,16 +980,22 @@ function installJniTrace(Native) {
                 jniRegisteredState = Number(probeInfo.registered) === 1 ? 1 : 0;
                 log('[jni] registered=' + probeInfo.registered +
                     ' probeTick=' + probeInfo.probeTick +
-                    ' probeObject=' + probeInfo.probeObject);
-                ['probeTick', 'probeObject'].forEach(function (name) {
+                    ' probeObject=' + probeInfo.probeObject +
+                    ' probeExercise=' + probeInfo.probeExercise);
+                ['probeTick', 'probeObject', 'probeExercise'].forEach(function (name) {
+                    if (!probeInfo[name]) return;
                     var target = ptr(probeInfo[name]);
                     if (!validPtr(target)) return;
-                    Interceptor.attach(target, { onEnter: function () {
-                        counts.jni++;
-                        counts.jniCall++;
-                        sparse('jni', counts.jni, name + ' fn=' + target +
-                            ' x0=' + this.x0 + ' x1=' + this.x1);
-                    }});
+                    // 用闭包固定每个动态注册方法的 name/target；如果直接在
+                    // forEach 中用 var，回调触发时会全部显示成最后一个方法。
+                    (function (probeName, probeTarget) {
+                        Interceptor.attach(probeTarget, { onEnter: function () {
+                            counts.jni++;
+                            counts.jniCall++;
+                            sparse('jni', counts.jni, probeName + ' fn=' + probeTarget +
+                                ' x0=' + this.x0 + ' x1=' + this.x1);
+                        }});
+                    })(name, target);
                 });
             } catch (error) { log('JniProbe fallback decode failed: ' + (error.message || error)); }
         }
