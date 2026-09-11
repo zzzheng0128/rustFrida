@@ -10,8 +10,6 @@ var counts = { java: 0, c: 0, dex: 0, dexPayload: 0, method: 0,
     gum: 0, other: 0 };
 var info = null;
 var nativeApi = null;
-var appClassLoader = null;
-var dexPayloadHooked = false;
 var methodSlot = null;
 var methodHooks = Object.create(null);
 var methodGateEnabled = false;
@@ -381,6 +379,36 @@ function getNative() {
 }
 
 function installJavaHooks(Native) {
+    // Application.onCreate 已经启动后，ART 可能把 DexProbe 直接调用点
+    // 编译成 quick entry。先去优化一次，再替换 implementation，确保
+    // 后续 rf-dex worker 的调用仍会经过 JS hook。
+    try {
+        if (Java && typeof Java.deoptimizeEverything === 'function') {
+            Java.deoptimizeEverything();
+            log('ART deoptimized before Java hooks');
+        }
+    } catch (error) {
+        log('ART deoptimize skipped: ' + (error.message || error));
+    }
+    // DexProbe.loadAndRun() 内部会创建新的 InMemoryDexClassLoader。直接把
+    // Context/ClassLoader 句柄交给 JS hook 在并发 GC 下容易形成 stale ref；
+    // Native.nativeSourceMark 是应用自己的稳定观测点，分别记录 Dex 加载
+    // (kind=2) 和 payload.run (kind=3)，同时保留 Java 层的实时回调语义。
+    var sourceMark = Native.nativeSourceMark;
+    sourceMark.implementation = function (kind) {
+        var result = this.$orig.call(this, kind);
+        var marker = Number(kind);
+        if (marker === 2) {
+            counts.dex++;
+            sparse('dex', counts.dex, 'loadAndRun sourceMark');
+        } else if (marker === 3) {
+            counts.dexPayload++;
+            sparse('dexPayload', counts.dexPayload, 'payload.run sourceMark');
+        }
+        maybeVerify();
+        return result;
+    };
+    log('Dex sourceMark hook installed (kind=2 load, kind=3 payload)');
     var tick = Native.nativeAgentTick;
     tick.implementation = function () {
         counts.java++;
@@ -397,53 +425,7 @@ function installJavaHooks(Native) {
         log('Application.onCreate entered before app startup work');
         return this.$orig.apply(this, arguments);
     };
-    installDynamicDexHook();
     log('Java hooks installed');
-}
-
-function installDynamicDexHook() {
-    var DexProbe = Java.use('com.rustfrida.compatdemo.DexProbe');
-    var loadAndRun = DexProbe.loadAndRun.overload('android.content.Context', 'int');
-    var getLastLoader = DexProbe.getLastLoader.overload();
-    try {
-        var loaders = Java.classLoaders();
-        if (loaders && loaders.length > 0) appClassLoader = loaders[0];
-    } catch (_) {}
-    function hookPayload() {
-        if (dexPayloadHooked) return;
-        var loader = getLastLoader();
-        if (!loader) return;
-        try {
-            Java.setClassLoader(loader);
-            var Payload = Java.use('com.rustfrida.compatdemo.payload.DexPayload');
-            var run = Payload.run.overload('int');
-            run.implementation = function (seed) {
-                counts.dexPayload++;
-                maybeVerify();
-                var result = this.$orig.apply(this, arguments);
-                sparse('dexPayload', counts.dexPayload,
-                    'run seed=' + seed + ' result=' + String(result));
-                return result;
-            };
-            dexPayloadHooked = true;
-            log('dynamic DexPayload.run(int) hook installed');
-        } catch (error) {
-            log('dynamic DexPayload hook failed: ' + (error.message || error));
-        } finally {
-            if (appClassLoader) {
-                try { Java.setClassLoader(appClassLoader); } catch (_) {}
-            }
-        }
-    }
-    loadAndRun.implementation = function () {
-        var result = this.$orig.apply(this, arguments);
-        counts.dex++;
-        maybeVerify();
-        sparse('dex', counts.dex, 'loadAndRun result=' + String(result));
-        hookPayload();
-        return result;
-    };
-    log('DexProbe.loadAndRun hook installed');
 }
 
 function readNativeInfo() {
@@ -679,10 +661,10 @@ function findGlobalExport(name) {
     return null;
 }
 
-// GumTrace 目标是本 demo 自己的 rf_agent_hot，避免旧的 libmetasec 固定偏移。
+// GumTrace 使用 demo 独立的 rf_gumtrace_hot，避免和 C hook 共用入口。
 function installGumTrace() {
     var targetModule = 'libcompatdemo.so';
-    var targetSymbol = 'rf_agent_hot';
+    var targetSymbol = 'rf_gumtrace_hot';
     var soPath = '/data/local/tmp/libGumTrace.so';
     var traceFile = '/data/local/tmp/gumtrace-compatdemo.log';
     var armed = false;
@@ -698,10 +680,10 @@ function installGumTrace() {
             // CMake 的导出表在不同 NDK/strip 配置下可能被裁剪；nativeInfo()
             // 提供当前 ASLR 基址和同一份导出偏移，因此 GumTrace 不依赖 dynsym。
             var nativeInfo = readNativeInfo();
-            log('GumTrace nativeInfo base=' + nativeInfo.base + ' agent_offset=' + nativeInfo.agent_offset);
+            log('GumTrace nativeInfo base=' + nativeInfo.base + ' gum_offset=' + nativeInfo.gum_offset);
             var target = null;
-            if (nativeInfo.base && nativeInfo.agent_offset) {
-                target = ptr(nativeInfo.base).add(parseInt(hex(nativeInfo.agent_offset), 16));
+            if (nativeInfo.base && nativeInfo.gum_offset) {
+                target = ptr(nativeInfo.base).add(parseInt(hex(nativeInfo.gum_offset), 16));
             }
             log('GumTrace calculated target=' + target + ' valid=' + validPtr(target));
             if (!validPtr(target)) target = Module.findExportByName(targetModule, targetSymbol);

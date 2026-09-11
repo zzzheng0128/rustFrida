@@ -29,6 +29,8 @@ public final class Native {
     public static native String nativeUprobeMatrixInfo();
     public static native long nativeHwbpBurst(int loops);
     public static native long nativeAgentTick();
+    /** GumTrace 专用 native 入口，与 C hook 的 rf_agent_hot 分离。 */
+    public static native long nativeGumTraceTick();
     public static native long nativeObjectExercise(int loops);
     /** 通过 RegisterNatives 动态注册 JniProbe 的两个 JNI 方法。 */
     public static native boolean nativeRegisterJniProbe();
