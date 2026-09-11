@@ -16,6 +16,7 @@ public final class CompatApplication extends Application {
         long begin = SystemClock.elapsedRealtimeNanos();
         Log.i("RFCompatDemo", "[BOOT] Application.onCreate begin");
         super.onCreate();
+        DexProbe.initialize(this);
         Native.nativeSourceMark(1);
         boolean extreme = Native.nativeExtremeEnabled();
         boolean lowFrequency = Native.nativeLowFrequencyEnabled();

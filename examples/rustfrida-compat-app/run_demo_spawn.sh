@@ -685,6 +685,14 @@ if [[ "$MODE_SPEC" == mkpm-* || "$MODE_SPEC" == *,mkpm-* ]]; then
 fi
 
 has_lane() {
+    # all 只包含菜单中的基础通道；矩阵/轮换是独立实验，必须显式选择，
+    # 否则普通 all 测试会被“未产生矩阵对账行”误报为失败。
+    case "$1" in
+        hwbp-matrix|hwbp-rotate|uprobe-matrix|uprobe-limit)
+            [[ "$MODE_SPEC" == "$1" ]] && return 0
+            return 1
+            ;;
+    esac
     [[ "$MODE_SPEC" == "all" ]] && return 0
     [[ "$1" == "hwbp" && "$MODE_SPEC" == "hwbp-matrix" ]] && return 0
     [[ "$1" == "hwbp" && "$MODE_SPEC" == "hwbp-rotate" ]] && return 0
@@ -1011,6 +1019,15 @@ VERIFY_SOURCE_JNI="$(verify_field source_jni)"; VERIFY_OBSERVED_JNI="$(verify_fi
 VERIFY_SOURCE_METHOD="$(verify_field source_method)"; VERIFY_OBSERVED_METHOD="$(verify_field observed_method)"
 VERIFY_GATE_TIMEOUTS="$(verify_field gate_timeouts)"
 VERIFY_MISSING="$(verify_field missing)"
+: "${VERIFY_SOURCE_SVC:=0}" "${VERIFY_OBSERVED_SVC:=0}"
+: "${VERIFY_SOURCE_UPROBE:=0}" "${VERIFY_OBSERVED_UPROBE:=0}"
+: "${VERIFY_SOURCE_HWBP:=0}" "${VERIFY_OBSERVED_HWBP:=0}"
+: "${VERIFY_SOURCE_C:=0}" "${VERIFY_OBSERVED_C:=0}"
+: "${VERIFY_SOURCE_JAVA:=0}" "${VERIFY_OBSERVED_JAVA:=0}"
+: "${VERIFY_SOURCE_DEX:=0}" "${VERIFY_OBSERVED_DEX:=0}"
+: "${VERIFY_SOURCE_DEXPAYLOAD:=0}" "${VERIFY_OBSERVED_DEXPAYLOAD:=0}"
+: "${VERIFY_SOURCE_JNI:=0}" "${VERIFY_OBSERVED_JNI:=0}"
+: "${VERIFY_SOURCE_METHOD:=0}" "${VERIFY_OBSERVED_METHOD:=0}"
 HWBP_MATRIX_LINES="$(grep -a '\[HWBP-MATRIX\]' "$RUN_DIR/rf-output.log" 2>/dev/null || true)"
 HWBP_MATRIX_SPEC_COUNT="$(printf '%s\n' "$HWBP_MATRIX_LINES" | sed -n 's/.*\[HWBP-MATRIX\] \([^ ]*\).*/\1/p' | sort -u | sed '/^$/d' | wc -l | tr -d ' ')"
 HWBP_MATRIX_FAILURES="$(printf '%s\n' "$HWBP_MATRIX_LINES" | awk '/verdict=FAIL/{n++} END{print n+0}')"
@@ -1076,8 +1093,22 @@ DEVICE_REBOOT=0
 if [[ -n "$BOOT_ID_BEFORE" && -n "$BOOT_ID_AFTER" && "$BOOT_ID_BEFORE" != "$BOOT_ID_AFTER" ]]; then
     DEVICE_REBOOT=1
 fi
+VERIFY_HARD_MISMATCH=0
+# 高频下 SVC/uprobe/HWBP/方法回调可能受预算限制；只要观察端仍有事件，
+# 这是 partial（背压），不是观察者完全失联。C/Java/JNI 是同步 hook，
+# 出现明显源端领先则仍按 hard mismatch 处理。
+if has_lane svc && (( VERIFY_SOURCE_SVC > 0 )) && (( VERIFY_OBSERVED_SVC == 0 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane uprobe && (( VERIFY_SOURCE_UPROBE > 0 )) && (( VERIFY_OBSERVED_UPROBE == 0 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane hwbp && (( VERIFY_SOURCE_HWBP > 0 )) && (( VERIFY_OBSERVED_HWBP == 0 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane hwbp && ! has_lane hwbp-rotate && (( VERIFY_SOURCE_METHOD > 0 )) && (( VERIFY_OBSERVED_METHOD == 0 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane c && (( VERIFY_SOURCE_C > VERIFY_OBSERVED_C + 1 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane java && (( VERIFY_SOURCE_JAVA > VERIFY_OBSERVED_JAVA + 1 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane java && (( VERIFY_SOURCE_DEX > 0 )) && (( VERIFY_OBSERVED_DEX == 0 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane java && (( VERIFY_SOURCE_DEXPAYLOAD > 0 )) && (( VERIFY_OBSERVED_DEXPAYLOAD == 0 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane jnitrace && (( VERIFY_SOURCE_JNI > VERIFY_OBSERVED_JNI + 1 )); then VERIFY_HARD_MISMATCH=1; fi
+if has_lane jnitrace && (( VERIFY_SOURCE_JNI > 0 )) && (( VERIFY_OBSERVED_JNI == 0 )); then VERIFY_HARD_MISMATCH=1; fi
 VERIFY_PROBLEM=0
-if [[ "$VERIFY_VERDICT" == "MISMATCH" || "$HWBP_MATRIX_FAILURES" != "0" || "$UPROBE_MATRIX_FAILURES" != "0" ]]; then
+if [[ "$VERIFY_HARD_MISMATCH" == "1" || "$HWBP_MATRIX_FAILURES" != "0" || "$UPROBE_MATRIX_FAILURES" != "0" ]]; then
     VERIFY_PROBLEM=1
 fi
 if has_lane hwbp-matrix && (( HWBP_MATRIX_HOST_OK == 1 )); then
@@ -1087,10 +1118,11 @@ if has_lane hwbp-matrix && (( HWBP_MATRIX_HOST_OK == 1 )); then
 fi
 if [[ "$status" == "0" ]] && [[ "$UNEXPECTED_ANOMALIES" == "0" ]] && [[ "$DEVICE_REBOOT" == "0" ]] &&
    [[ "$VERIFY_PROBLEM" == "0" ]] &&
+   [[ "$VERIFY_VERDICT" != "MISMATCH" && "$VERIFY_VERDICT" != "PARTIAL" ]] &&
    ! grep -aqE '\[✗\]|\[失败\]|attach failed|hook failed|FATAL EXCEPTION|SIGSEGV|SIGABRT|kernel panic|KERNEL PANIC' "$RUN_DIR/rf-output.log"; then
     RUN_VERDICT="pass"
 elif [[ "$status" == "0" ]] && [[ "$UNEXPECTED_ANOMALIES" == "0" ]] && [[ "$DEVICE_REBOOT" == "0" ]] &&
-     [[ "$VERIFY_VERDICT" == "PARTIAL" ]]; then
+     [[ "$VERIFY_PROBLEM" == "0" ]] && [[ "$VERIFY_VERDICT" == "MISMATCH" || "$VERIFY_VERDICT" == "PARTIAL" ]]; then
     # PARTIAL 表示源端确实运行了，但 ring/输出预算丢过事件；这与崩溃或
     # “没有安装观察者”不同，单独保留给压力报告，不伪装成 pass。
     RUN_VERDICT="partial"

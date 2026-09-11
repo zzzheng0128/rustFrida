@@ -46,6 +46,7 @@ typedef uint64_t (*rf_object_method_t)(rf_demo_object_t *object, uint64_t seed);
 uint64_t rf_method_v1(rf_demo_object_t *object, uint64_t seed);
 uint64_t rf_method_v2(rf_demo_object_t *object, uint64_t seed);
 long rf_agent_hot(long seed);
+long rf_gumtrace_hot(long seed);
 
 /* uprobe 极限实验使用一组互不相同的函数入口。重复 attach 同一个地址只能
  * 测到重复事件，不能证明多个软件断点同时生效；这些入口让每个目标都有独立
@@ -74,6 +75,8 @@ static volatile uint64_t g_uprobe_counter;
 static volatile uint64_t g_uprobe_calls;
 static volatile uint64_t g_agent_counter;
 static volatile uint64_t g_agent_calls;
+static volatile uint64_t g_gumtrace_counter;
+static volatile uint64_t g_gumtrace_calls;
 static volatile uint64_t g_native_agent_tick_calls;
 static volatile uint64_t g_native_object_exercise_calls;
 static volatile uint64_t g_native_method_exercise_calls;
@@ -353,6 +356,17 @@ long rf_agent_hot(long seed) {
     return value;
 }
 
+/* GumTrace 使用独立入口，避免它和 C Interceptor 同时改写 rf_agent_hot。
+ * 混合模式下两个观察器各自拥有稳定的目标，不会互相覆盖。 */
+__attribute__((noinline, visibility("default")))
+long rf_gumtrace_hot(long seed) {
+    __atomic_add_fetch(&g_gumtrace_calls, 1, __ATOMIC_RELAXED);
+    long value = (long) g_gumtrace_counter;
+    value = (value + (seed ^ 0x2468aceL)) ^ 0x55aa55aaL;
+    g_gumtrace_counter = (uint64_t) value;
+    return value;
+}
+
 static int rf_read_tracer_pid(void) {
     char data[4096];
     long fd = rf_openat(-100, "/proc/self/status", O_RDONLY, 0);
@@ -471,14 +485,16 @@ Java_com_rustfrida_compatdemo_Native_nativeInfo(JNIEnv *env, jclass clazz) {
     uintptr_t step = (uintptr_t) rf_object_step;
     uintptr_t up = (uintptr_t) rf_uprobe_hot;
     uintptr_t agent = (uintptr_t) rf_agent_hot;
+    uintptr_t gumtrace = (uintptr_t) rf_gumtrace_hot;
     uintptr_t hwbp = (uintptr_t) rf_hwbp_hot;
     return rf_json(env,
                    "{\"library\":\"%s\",\"base\":\"0x%" PRIxPTR "\","
                    "\"object_addr\":\"0x%" PRIxPTR "\",\"object_size\":%zu,"
                    "\"step_offset\":\"0x%" PRIxPTR "\","
-                   "\"uprobe_offset\":\"0x%" PRIxPTR "\","
-                   "\"agent_offset\":\"0x%" PRIxPTR "\","
-                   "\"hwbp_offset\":\"0x%" PRIxPTR "\","
+                   "\"uprobe_offset\":\"0x%" PRIxPTR "\"," 
+                   "\"agent_offset\":\"0x%" PRIxPTR "\"," 
+                   "\"gum_offset\":\"0x%" PRIxPTR "\"," 
+                   "\"hwbp_offset\":\"0x%" PRIxPTR "\"," 
                    "\"read_offset\":\"0x%zx\",\"write_offset\":\"0x%zx\","
                    "\"read_addr\":\"0x%" PRIxPTR "\"," 
                    "\"write_addr\":\"0x%" PRIxPTR "\"," 
@@ -492,7 +508,8 @@ Java_com_rustfrida_compatdemo_Native_nativeInfo(JNIEnv *env, jclass clazz) {
                    "\"init_svc_byte\":%" PRIu64 "}",
                    path, base, (uintptr_t) object, sizeof(*object),
                    base ? step - base : 0, base ? up - base : 0,
-                   base ? agent - base : 0, base ? hwbp - base : 0,
+                   base ? agent - base : 0, base ? gumtrace - base : 0,
+                   base ? hwbp - base : 0,
                    offsetof(rf_demo_object_t, read_slot),
                    offsetof(rf_demo_object_t, write_slot),
                    (uintptr_t) &object->read_slot,
@@ -520,6 +537,7 @@ Java_com_rustfrida_compatdemo_Native_nativeCounters(JNIEnv *env, jclass clazz) {
                    "\"uprobe_hot\":%" PRIu64 ",\"hwbp_hot\":%" PRIu64 ","
                    "\"hwbp_reads\":%" PRIu64 ",\"hwbp_writes\":%" PRIu64 ","
                    "\"agent_hot\":%" PRIu64 ",\"native_agent_tick\":%" PRIu64 ","
+                   "\"gumtrace_hot\":%" PRIu64 ","
                    "\"native_object_exercise\":%" PRIu64 ","
                    "\"native_method_exercise\":%" PRIu64 ","
                    "\"native_method_switch\":%" PRIu64 ","
@@ -555,6 +573,7 @@ Java_com_rustfrida_compatdemo_Native_nativeCounters(JNIEnv *env, jclass clazz) {
                    rf_count_load(&g_uprobe_calls), rf_count_load(&g_hwbp_calls),
                    rf_count_load(&g_hwbp_read_accesses), rf_count_load(&g_hwbp_write_accesses),
                    rf_count_load(&g_agent_calls), rf_count_load(&g_native_agent_tick_calls),
+                   rf_count_load(&g_gumtrace_calls),
                    rf_count_load(&g_native_object_exercise_calls),
                    rf_count_load(&g_native_method_exercise_calls),
                    rf_count_load(&g_native_method_switch_calls), rf_count_load(&g_method_calls),
@@ -999,6 +1018,13 @@ Java_com_rustfrida_compatdemo_Native_nativeAgentTick(JNIEnv *env, jclass clazz) 
     (void) clazz;
     __atomic_add_fetch(&g_native_agent_tick_calls, 1, __ATOMIC_RELAXED);
     return (jlong) rf_agent_hot(1);
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_rustfrida_compatdemo_Native_nativeGumTraceTick(JNIEnv *env, jclass clazz) {
+    (void) env;
+    (void) clazz;
+    return (jlong) rf_gumtrace_hot(1);
 }
 
 JNIEXPORT jlong JNICALL

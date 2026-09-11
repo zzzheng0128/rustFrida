@@ -16,6 +16,7 @@ RUN_SECS=60 BUILD_RF=0 bash examples/rustfrida-compat-app/run_demo_spawn.sh 0
 - [`examples/templates/README.md`](examples/templates/README.md)：可复制的 JS 模板；
 - [`mkpms/DEMO_GUIDE.md`](mkpms/DEMO_GUIDE.md)：KPM 独立 demo 的源码索引；
 - [`mkpms/kpms/mkpm/README.md`](mkpms/kpms/mkpm/README.md)：合并 KPM 的编译约束和完整 ctl 命令；
+- [`doc/git-branch-submodule-workflow.md`](doc/git-branch-submodule-workflow.md)：分支合并、子模块推送和 P5 独立开发流程；
 - `doc/`：实现推导、历史故障和设计记录，只在需要深入查证时阅读；
 - `runs/`：设备实验产物，不作为文档入口，也不应把凭据和未脱敏日志提交到公开仓库。
 
