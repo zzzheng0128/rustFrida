@@ -8,4 +8,4 @@
 [submodule "mkpms"]
 	path = mkpms
 	url = https://github.com/zzzheng0128/mkpms.git
-	branch = mkpm-merged
+	branch = feat/trace-mkpms-latest
