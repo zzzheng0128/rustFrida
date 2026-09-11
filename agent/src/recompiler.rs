@@ -33,8 +33,8 @@ const TRAMPOLINE_PAGE_CANDIDATES: &[usize] = &[1, 2, 4, 8, MAX_TRAMPOLINE_PAGES]
 const MIN_HOOK_SLOT_BYTES: usize = 32;
 const RECOMP_NEAR_RANGE: i64 = 112 * 1024 * 1024; // Keep original-page fallback B within ARM64 imm26 range.
 
-static VMA_RECOMP_CODE: &[u8] = b"wwb_recomp_code\0";
-static VMA_RECOMP_TRAMP: &[u8] = b"wwb_recomp_tramp\0";
+static VMA_RECOMP_CODE: &[u8] = b"dalvik-jit-code-cache\0";
+static VMA_RECOMP_TRAMP: &[u8] = b"dalvik-jit-code-cache\0";
 
 // C FFI
 extern "C" {

@@ -977,7 +977,7 @@ fn run_loader_handshake(
     // 2. 发送 agent SO fd (创建 memfd → 写入 AGENT_SO → sendmsg)
     //    关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
     //    否则 untrusted_app 因 MLS 分类不匹配无法通过 SCM_RIGHTS 接收 tmpfs fd。
-    let agent_memfd = unsafe { libc::memfd_create(b"wwb_so\0".as_ptr() as _, 0) };
+    let agent_memfd = unsafe { libc::memfd_create(b"dalvik-jit-code-cache\0".as_ptr() as _, 0) };
     if agent_memfd < 0 {
         return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
     }
@@ -1060,7 +1060,7 @@ fn run_loader_handshake(
 
     let loader_ctx = read_loader_runtime_context(target_pid, loader_ctx_addr)?;
     if loader_ctx.agent_current_thread_eval_impl == 0 {
-        return Err("Loader 未解析 rustfrida_loadjs_current_thread".to_string());
+        return Err("Loader 未解析 agent_eval_js_current_thread".to_string());
     }
 
     // 5. 发送 ACK
@@ -1130,7 +1130,7 @@ fn inject_via_bootstrapper_once(
     pid: i32,
     string_overrides: &std::collections::HashMap<String, String>,
 ) -> Result<InjectionResult, String> {
-    log_info!("正在附加到进程 PID: {} (Frida-style bootstrapper)", pid);
+    log_info!("正在附加到进程 PID: {} (remote bootstrapper)", pid);
 
     let trace_tid = choose_injection_thread(pid);
     if trace_tid != pid {
@@ -1293,9 +1293,9 @@ fn inject_via_bootstrapper_once(
     // 写入字符串字面量
     let str_base = loader_libc_addr + size_of::<FridaLibcApi>();
     let entrypoint_str = b"hello_entry\0";
-    let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
+    let current_thread_eval_str = b"agent_eval_js_current_thread\0";
     let data_str = b"\0";
-    let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
+    let fallback_str = format!("\x00sysmon-{}\0", pid); // abstract socket: \0 prefix
     mem.pwrite_all(entrypoint_str, str_base as u64)?;
     let current_thread_eval_str_addr = str_base + entrypoint_str.len();
     mem.pwrite_all(current_thread_eval_str, current_thread_eval_str_addr as u64)?;

@@ -319,7 +319,7 @@ fn do_spawn(
 ) {
     let sid = session.id;
     std::thread::Builder::new()
-        .name("wwb-spawn".into())
+        .name("Chrome_ChildIOT".into())
         .spawn(move || {
             // ensure_zymbiote_loaded 内部有幂等保护，并发安全
             match spawn::spawn_and_inject(&package, &string_overrides) {
@@ -375,7 +375,7 @@ fn do_spawn(
                 }
             }
         })
-        .expect("spawn wwb-spawn thread");
+        .expect("spawn child-io");
 }
 
 fn do_attach(
@@ -388,7 +388,7 @@ fn do_attach(
 ) {
     let sid = session.id;
     std::thread::Builder::new()
-        .name("wwb-attach".into())
+        .name("Chrome_InProcRe".into())
         .spawn(move || {
             match inject_via_bootstrapper(pid, &string_overrides) {
                 Ok(injection) => {
@@ -424,7 +424,7 @@ fn do_attach(
                 }
             }
         })
-        .expect("spawn wwb-attach thread");
+        .expect("spawn inproc-re");
 }
 
 // ────────────────────────── Session REPL ──────────────────────────

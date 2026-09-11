@@ -544,7 +544,7 @@ fn generate_socket_name() -> String {
     for _ in 0..32 {
         let _ = write!(hex, "{:x}", rng.gen::<u8>() & 0xf);
     }
-    format!("rustfrida-zymbiote-{}", hex)
+    format!("zygote-shm-{}", hex)
 }
 
 /// 检查进程是否为 64 位（读取 /proc/<pid>/exe 的 ELF header）
@@ -679,19 +679,19 @@ fn start_listener_thread(socket_name: &str) -> Result<(), String> {
     };
 
     std::thread::Builder::new()
-        .name("wwb-zymacc".into())
+        .name("CrZygoteAccept".into())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
                         std::thread::Builder::new()
-                            .name("wwb-zymconn".into())
+                            .name("CrZygoteConn".into())
                             .spawn(move || {
                                 if let Err(e) = handle_zymbiote_connection(stream) {
                                     log_verbose!("Zymbiote 连接处理错误: {}", e);
                                 }
                             })
-                            .expect("spawn wwb-zymconn thread");
+                            .expect("spawn zygote-conn");
                     }
                     Err(e) => {
                         log_verbose!("Zymbiote accept 错误: {}", e);
@@ -700,7 +700,7 @@ fn start_listener_thread(socket_name: &str) -> Result<(), String> {
                 }
             }
         })
-        .expect("spawn wwb-zymacc thread");
+        .expect("spawn zygote-accept");
 
     Ok(())
 }
@@ -2321,9 +2321,9 @@ fn build_payload(
             .ok_or_else(|| format!("zymbiote ELF 中未找到符号 {}", name))
     };
 
-    let replacement_setargv0_offset = find_symbol_offset("rustfrida_zymbiote_replacement_setargv0")?;
-    let replacement_setcontext_offset = find_symbol_offset("rustfrida_zymbiote_replacement_setcontext")?;
-    let replacement_prctl_offset = find_symbol_offset("rustfrida_zymbiote_replacement_capset")?;
+    let replacement_setargv0_offset = find_symbol_offset("zym_replacement_setargv0")?;
+    let replacement_setcontext_offset = find_symbol_offset("zym_replacement_setcontext")?;
+    let replacement_prctl_offset = find_symbol_offset("zym_replacement_capset")?;
     let zymbiote_offset = find_symbol_offset("zymbiote")?;
 
     // 绝对地址 = payload_base + 段内偏移

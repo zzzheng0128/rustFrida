@@ -1,5 +1,8 @@
 /*
- * hook_engine_mem.c - Memory pool management, XOM-safe read, wxshadow, cache flush
+ * hook_engine_mem.c：用户态内存后端，集中管理内存池、读写适配及缓存相关操作。
+ *
+ * 后端请求成功、代码可执行、资源不再被使用是不同条件。涉及内核映射的性质
+ * 需要配套内核实现与平台证据确认，不能仅从用户态日志或区域名称推断。
  *
  * Contains: pool permission management, entry allocation/free, wxshadow patching,
  * write_jump_back, hook_write_jump, hook_alloc, hook_relocate_instructions,
@@ -335,7 +338,7 @@ int wxshadow_patch(void* addr, const void* buf, size_t len) {
         hook_log("wxshadow PATCH succeeded after PMD split: addr=%p", addr);
     }
 
-    hook_log("wxshadow stealth patch OK: addr=%p len=%zu", addr, len);
+    hook_log("wxshadow patch OK: addr=%p len=%zu", addr, len);
     return 0;
 }
 
@@ -418,7 +421,7 @@ void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
     int fixed = 0;
     int scanned = 0;
 
-    hook_log("[stealth_ldr_reloc] scanning page %#lx for patch at %p len=%d",
+    hook_log("[ldr_reloc] scanning page %#lx for patch at %p len=%d",
              (unsigned long)page_start, patch_addr, patch_len);
 
     for (uintptr_t pc = page_start; pc < page_end; pc += 4) {
@@ -447,7 +450,7 @@ void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
          * 分配失败意味着该 LDR 无法修复 → wxshadow 会 livelock → 必须警告。 */
         void* tramp = hook_alloc_near_range(48, (void*)pc, 0x8000000 /* ±128MB */);
         if (!tramp) {
-            hook_log("\033[31m[stealth_ldr_reloc] CRITICAL: alloc trampoline FAILED for LDR at %#lx "
+            hook_log("\033[31m[ldr_reloc] CRITICAL: alloc trampoline FAILED for LDR at %#lx "
                      "(no memory within ±128MB). This LDR will livelock under wxshadow!\033[0m",
                      (unsigned long)pc);
             continue;
@@ -491,7 +494,7 @@ void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
         /* 构造 B 指令跳到 trampoline */
         int64_t b_offset = (int64_t)(uint64_t)tramp - (int64_t)pc;
         if (b_offset < -0x8000000 || b_offset > 0x7FFFFFC) {
-            hook_log("[stealth_ldr_reloc] B range exceeded for LDR at %#lx → tramp %p",
+            hook_log("[ldr_reloc] B range exceeded for LDR at %#lx → tramp %p",
                      (unsigned long)pc, tramp);
             continue;
         }
@@ -499,17 +502,17 @@ void wxshadow_relocate_same_page_ldr_literals(void* patch_addr, int patch_len) {
 
         /* wxshadow patch: 替换 LDR literal 为 B trampoline */
         if (wxshadow_patch((void*)pc, &b_insn, 4) != 0) {
-            hook_log("[stealth_ldr_reloc] wxshadow_patch failed for LDR at %#lx", (unsigned long)pc);
+            hook_log("[ldr_reloc] wxshadow_patch failed for LDR at %#lx", (unsigned long)pc);
             continue;
         }
 
         fixed++;
-        hook_log("[stealth_ldr_reloc] fixed LDR at %#lx → tramp %p (data_size=%d, %s, rt=%d)",
+        hook_log("[ldr_reloc] fixed LDR at %#lx → tramp %p (data_size=%d, %s, rt=%d)",
                  (unsigned long)pc, tramp, data_size, is_simd ? "SIMD" : "GPR", rt);
     }
 
     if (fixed > 0) {
-        hook_log("[stealth_ldr_reloc] fixed %d same-page LDR literals on page %#lx",
+        hook_log("[ldr_reloc] fixed %d same-page LDR literals on page %#lx",
                  fixed, (unsigned long)page_start);
     }
 }
@@ -635,7 +638,7 @@ static void* alloc_from_pool(ExecPool* pool, size_t size) {
  * target=NULL 时退化为普通 mmap(NULL)。
  * 返回 mmap 得到的指针，MAP_FAILED 表示失败。
  *
- * 设计要点：/proc/self/maps 可能被 KPM 隐藏部分 VMA（如 wwb_hook_pool）。
+ * 设计要点：/proc/self/maps 可能被 KPM 隐藏部分 VMA（如 hook pool）。
  * 因此扫 gap 只是缩范围避开系统 VMA，真正判定空位交给 MAP_FIXED_NOREPLACE
  * ——该 flag 走内核 VMA 树，绕过 /proc 层过滤。EEXIST → 在同 gap 内按
  * alloc_size 步进跳过隐藏占用，而不是 fallback 到任意地址（会飞出 ±range）。 */
@@ -851,7 +854,7 @@ static ExecPool* create_pool_near_range_sized(void* target, int64_t max_range, s
 #define PR_SET_VMA_ANON_NAME 0
 #endif
     prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, (unsigned long)ptr, pool_size,
-          (unsigned long)"wwb_hook_pool");
+          (unsigned long)"dalvik-jit-code-cache");
 
     ExecPool* pool = &g_engine.pools[g_engine.pool_count++];
     pool->base = ptr;
@@ -1318,11 +1321,11 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             void* second_addr = (void*)(t + first_len);
 
             if (wxshadow_patch(second_addr, jump_buf + first_len, second_len) != 0) {
-                hook_log("[STEALTH1] cross-page second segment failed target=%p", target);
+                hook_log("[wxpatch] cross-page second segment failed target=%p", target);
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
             if (wxshadow_patch(target, jump_buf, first_len) != 0) {
-                hook_log("[STEALTH1] cross-page first segment failed target=%p, rolling back second", target);
+                hook_log("[wxpatch] cross-page first segment failed target=%p, rolling back second", target);
                 wxshadow_release(second_addr);
                 return HOOK_ERROR_WXSHADOW_FAILED;
             }
@@ -1330,7 +1333,7 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             wxshadow_relocate_same_page_ldr_literals(target, (int)first_len);
             wxshadow_relocate_same_page_ldr_literals(second_addr, (int)second_len);
             ok = 1;
-            hook_log("[STEALTH1] cross-page patch OK target=%p split=%zu+%zu", target, first_len, second_len);
+            hook_log("[wxpatch] cross-page patch OK target=%p split=%zu+%zu", target, first_len, second_len);
         } else {
             if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
                 wxshadow_relocate_same_page_ldr_literals(target, jump_result);
@@ -1346,7 +1349,7 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         /* stealth1 严格模式: wxshadow 失败拒绝降级到 mprotect。
          * 降级会直接修改原始内存字节 + RWX 权限变更，
          * CRC 校验 / /proc/self/maps 扫描均可检测。 */
-        hook_log("\033[31m[STEALTH] wxshadow 失败 %p，拒绝降级 mprotect\033[0m", target);
+        hook_log("\033[31m[wxpatch] wxshadow 失败 %p，拒绝降级 mprotect\033[0m", target);
         return HOOK_ERROR_WXSHADOW_FAILED;
     }
 

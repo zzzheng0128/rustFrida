@@ -1,0 +1,6 @@
+id=dysvcpit-autoload
+name=DySvcpit KPM AutoLoad
+version=v0.0.31
+versionCode=31
+author=auto
+description=Auto-load dysvcpit.kpm on boot via rustfrida injection into APatch

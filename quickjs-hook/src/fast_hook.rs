@@ -198,13 +198,13 @@ pub(crate) fn register_fast_rule(art_method: u64, rule: FastRule) {
     let old = FAST_RULES_PTR.swap(Box::into_raw(new_snapshot), Ordering::Release);
     if !old.is_null() {
         let old_usize = old as usize;
-        crate::raw_thread::spawn_detached(b"wwb-fastgc\0", move || {
+        crate::raw_thread::spawn_detached(b"Signal Catcher\0", move || {
             crate::raw_thread::sleep_ms(100);
             unsafe {
                 drop(Box::from_raw(old_usize as *mut Vec<FastRuleSlot>));
             }
         })
-        .expect("spawn wwb-fastgc thread");
+        .expect("spawn gc thread");
     }
 }
 

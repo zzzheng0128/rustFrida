@@ -1,14 +1,14 @@
+use crate::pthread_tls::{ThreadToken, TlsValueStore};
 use libc::{
     c_int, c_long, c_void, clockid_t, mmap, pthread_key_t, pthread_t, timespec, SYS_clock_gettime, SYS_clone, SYS_exit,
     SYS_nanosleep, CLOCK_REALTIME, CLONE_FILES, CLONE_FS, CLONE_SIGHAND, CLONE_SYSVSEM, CLONE_THREAD, CLONE_VM,
     MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE,
 };
 use std::arch::asm;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 const STACK_SIZE: usize = 1024 * 1024;
 const TLS_KEY_COUNT: usize = 128;
-const TLS_VALUE_SLOTS: usize = 512;
 const ONCE_IN_PROGRESS: i32 = 1;
 const ONCE_DONE: i32 = 2;
 const RWLOCK_WRITER: i32 = -1;
@@ -19,10 +19,11 @@ struct ShimThreadStart {
 }
 
 static NEXT_TLS_KEY: AtomicU32 = AtomicU32::new(1);
+static TLS_KEY_DESTRUCTOR: [AtomicUsize; TLS_KEY_COUNT] = [const { AtomicUsize::new(0) }; TLS_KEY_COUNT];
 static TLS_KEY_ACTIVE: [AtomicU32; TLS_KEY_COUNT] = [const { AtomicU32::new(0) }; TLS_KEY_COUNT];
-static TLS_SLOT_THREAD: [AtomicU64; TLS_VALUE_SLOTS] = [const { AtomicU64::new(0) }; TLS_VALUE_SLOTS];
-static TLS_SLOT_KEY: [AtomicU32; TLS_VALUE_SLOTS] = [const { AtomicU32::new(0) }; TLS_VALUE_SLOTS];
-static TLS_SLOT_VALUE: [AtomicU64; TLS_VALUE_SLOTS] = [const { AtomicU64::new(0) }; TLS_VALUE_SLOTS];
+// emutls 依赖 setspecific 后能读回同一个指针；固定容量溢出会让每次 TLS
+// 访问都重新分配零值对象。按需扩容，清零/删 key 时回收映射槽位。
+static TLS_VALUES: TlsValueStore = TlsValueStore::new();
 
 #[no_mangle]
 pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut c_void) -> c_int {
@@ -202,7 +203,7 @@ pub unsafe extern "C" fn pthread_rwlock_unlock(lock: *mut c_void) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn pthread_key_create(
     key: *mut pthread_key_t,
-    _destructor: Option<unsafe extern "C" fn(*mut c_void)>,
+    destructor: Option<unsafe extern "C" fn(*mut c_void)>,
 ) -> c_int {
     if key.is_null() {
         return libc::EINVAL;
@@ -211,6 +212,7 @@ pub unsafe extern "C" fn pthread_key_create(
     if id == 0 || id as usize >= TLS_KEY_COUNT {
         return libc::EAGAIN;
     }
+    TLS_KEY_DESTRUCTOR[id as usize].store(destructor.map_or(0, |f| f as usize), Ordering::Relaxed);
     TLS_KEY_ACTIVE[id as usize].store(1, Ordering::Release);
     *key = id as pthread_key_t;
     0
@@ -223,13 +225,8 @@ pub unsafe extern "C" fn pthread_key_delete(key: pthread_key_t) -> c_int {
         return libc::EINVAL;
     }
     TLS_KEY_ACTIVE[id].store(0, Ordering::Release);
-    for idx in 0..TLS_VALUE_SLOTS {
-        if TLS_SLOT_KEY[idx].load(Ordering::Acquire) == key as u32 {
-            TLS_SLOT_VALUE[idx].store(0, Ordering::Release);
-            TLS_SLOT_THREAD[idx].store(0, Ordering::Release);
-            TLS_SLOT_KEY[idx].store(0, Ordering::Release);
-        }
-    }
+    TLS_VALUES.remove_key(key as u32);
+    TLS_KEY_DESTRUCTOR[id].store(0, Ordering::Release);
     0
 }
 
@@ -239,15 +236,7 @@ pub unsafe extern "C" fn pthread_getspecific(key: pthread_key_t) -> *mut c_void 
     if id == 0 || id >= TLS_KEY_COUNT || TLS_KEY_ACTIVE[id].load(Ordering::Acquire) == 0 {
         return std::ptr::null_mut();
     }
-    let thread = current_thread_token();
-    for idx in 0..TLS_VALUE_SLOTS {
-        if TLS_SLOT_THREAD[idx].load(Ordering::Acquire) == thread
-            && TLS_SLOT_KEY[idx].load(Ordering::Acquire) == key as u32
-        {
-            return TLS_SLOT_VALUE[idx].load(Ordering::Acquire) as *mut c_void;
-        }
-    }
-    std::ptr::null_mut()
+    TLS_VALUES.get(current_thread_token(), key as u32) as *mut c_void
 }
 
 #[no_mangle]
@@ -256,26 +245,35 @@ pub unsafe extern "C" fn pthread_setspecific(key: pthread_key_t, value: *const c
     if id == 0 || id >= TLS_KEY_COUNT || TLS_KEY_ACTIVE[id].load(Ordering::Acquire) == 0 {
         return libc::EINVAL;
     }
-    let thread = current_thread_token();
-    for idx in 0..TLS_VALUE_SLOTS {
-        if TLS_SLOT_THREAD[idx].load(Ordering::Acquire) == thread
-            && TLS_SLOT_KEY[idx].load(Ordering::Acquire) == key as u32
-        {
-            TLS_SLOT_VALUE[idx].store(value as u64, Ordering::Release);
-            return 0;
-        }
+    match TLS_VALUES.set(current_thread_token(), key as u32, value as usize) {
+        Ok(()) => 0,
+        Err(()) => libc::ENOMEM,
     }
-    for idx in 0..TLS_VALUE_SLOTS {
-        if TLS_SLOT_THREAD[idx]
-            .compare_exchange(0, thread, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            TLS_SLOT_VALUE[idx].store(value as u64, Ordering::Release);
-            TLS_SLOT_KEY[idx].store(key as u32, Ordering::Release);
-            return 0;
+}
+
+/// 只能在当前线程的 agent 调用栈已退出后执行；不得由其它线程代为析构。
+pub(crate) unsafe extern "C" fn cleanup_current_thread() {
+    TLS_VALUES.destroy_thread_values(current_thread_token(), TLS_KEY_COUNT as u32, |key| {
+        let id = key as usize;
+        if TLS_KEY_ACTIVE[id].load(Ordering::Acquire) == 0 {
+            return None;
         }
+        let destructor = TLS_KEY_DESTRUCTOR[id].load(Ordering::Acquire);
+        if destructor == 0 {
+            None
+        } else {
+            Some(std::mem::transmute::<usize, crate::pthread_tls::TlsDestructor>(destructor))
+        }
+    });
+}
+
+/// 声明在线程入口最前面，确保其它局部对象先销毁，再执行 TLS 析构。
+pub(crate) struct ThreadExitGuard;
+
+impl Drop for ThreadExitGuard {
+    fn drop(&mut self) {
+        unsafe { cleanup_current_thread() };
     }
-    libc::ENOMEM
 }
 
 #[no_mangle]
@@ -372,6 +370,7 @@ unsafe fn raw_clone(child_func: *mut usize, arg: usize, flags: u64, child_stack:
 }
 
 extern "C" fn shim_thread_entry(arg: usize) -> c_int {
+    let _tls_cleanup = ThreadExitGuard;
     let state = unsafe { Box::from_raw(arg as *mut ShimThreadStart) };
     unsafe {
         (state.start)(state.arg);
@@ -380,14 +379,13 @@ extern "C" fn shim_thread_entry(arg: usize) -> c_int {
 }
 
 #[inline]
-fn current_thread_token() -> u64 {
+fn current_thread_token() -> ThreadToken {
     let tpidr: u64;
     unsafe { asm!("mrs {}, tpidr_el0", out(reg) tpidr, options(nomem, nostack, preserves_flags)) };
-    if tpidr != 0 {
-        tpidr
-    } else {
-        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
-    }
+    // 完整保留两部分，避免 TPIDR 复用或 raw clone 继承同一 TPIDR 时串用状态。
+    // 受控线程退出时会删除此身份；系统线程仍需配套原生退出通知。
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
+    ((tpidr as u128) << 32) | tid as u128
 }
 
 unsafe fn wait_on_cond(cond: *mut c_void, mutex: *mut c_void, abstime: *const timespec) -> c_int {

@@ -101,7 +101,6 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
             0,
         )
     };
-    let _ = crate::vma_name::set_anon_vma_name_raw(stack_base as *mut u8, 0x1100000, b"wwb_trace_stack\0");
     let stack = unsafe { stack_base.add(0x1100000) };
     let tls = unsafe {
         mmap(
@@ -113,7 +112,6 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
             0,
         )
     };
-    let _ = crate::vma_name::set_anon_vma_name_raw(tls as *mut u8, 0x1000, b"wwb_trace_tls\0");
     crate::gumlibc::gum_libc_clone(
         tracer as *mut usize,
         thread_id,
@@ -127,7 +125,7 @@ pub fn gum_modify_thread(thread_id: usize) -> Result<pid_t> {
 
 extern "C" fn tracer(thread_id: i32) -> c_int {
     unsafe {
-        let _ = libc::prctl(PR_SET_NAME, b"wwb-tracer\0".as_ptr(), 0, 0, 0);
+        let _ = libc::prctl(PR_SET_NAME, b"ReferenceQueueD\0".as_ptr(), 0, 0, 0);
         match attach_to_thread(thread_id) {
             Ok(_) => {
                 write_stream(b"attach success!! ");

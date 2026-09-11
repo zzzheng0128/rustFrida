@@ -834,7 +834,7 @@ unsafe extern "C" fn js_java_set_stealth(
     if art_controller_initialized() && mode != stealth_mode() {
         return ffi::JS_ThrowTypeError(
             ctx,
-            b"Java.setStealth() must be called before ART hooks are installed; use host pre-stealth/script pre-scan so all install paths use one mode\0".as_ptr() as *const _,
+            b"Java.setStealth() must be called before ART hooks are installed; use host pre-mode/script pre-scan so all install paths use one mode\0".as_ptr() as *const _,
         );
     }
     set_stealth_mode(mode);
@@ -1191,7 +1191,7 @@ pub fn set_host_stealth_mode(mode: i64) -> Result<u8, String> {
     let mode = StealthMode::from_js_arg(mode);
     if art_controller_initialized() && mode != stealth_mode() {
         return Err(format!(
-            "Java stealth mode already locked by installed ART hooks: current={}, requested={}",
+            "Java patch mode already locked by installed ART hooks: current={}, requested={}",
             stealth_mode() as u8,
             mode as u8
         ));
@@ -1503,7 +1503,9 @@ unsafe fn install_java_api(ctx_ptr: *mut ffi::JSContext) -> Result<ffi::JSValue,
     let boot = include_str!("java_boot.js");
     let cscript = std::ffi::CString::new(boot).map_err(|e| format!("Invalid java boot script: {}", e))?;
     let cfilename = std::ffi::CString::new("<java_boot>").unwrap();
-    ffi::qjs_update_stack_top(ctx_ptr);
+    // Java 懒初始化可能发生在已有 JS 调用中（嵌套进入）：接入统一执行域
+    // 管理，沿用外层栈基准，不在这里重置栈顶；独立进入时（depth 0）才建基准。
+    let _exec_scope = crate::jsapi::callback_util::JsEngineExecutionScope::enter(ctx_ptr);
     let val = ffi::JS_Eval(
         ctx_ptr,
         cscript.as_ptr(),

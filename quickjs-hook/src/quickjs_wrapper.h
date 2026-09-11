@@ -70,6 +70,20 @@ int qjs_value_to_u64(JSContext *ctx, uint64_t *pres, JSValue val);
 /* Stack top update for cross-thread usage */
 void qjs_update_stack_top(JSContext *ctx);
 
+/* 协作式让锁的帧链摘下/接回（实现在 quickjs.c，需要访问 JSRuntime 内部）。
+ * 只处理帧链，不等价完整的 JS_Suspend/JS_Resume。
+ * yield 时 qjs_save_current_stack_frame 摘下当前线程帧链并置 NULL；
+ * reacquire 时 qjs_restore_current_stack_frame 原样接回。同线程严格 LIFO。
+ * qjs_get_runtime 用于恢复前校验保存记录与当前 ctx 属于同一 Runtime。 */
+void *qjs_get_runtime(JSContext *ctx);
+void *qjs_save_current_stack_frame(JSContext *ctx);
+void qjs_restore_current_stack_frame(JSContext *ctx, void *sf);
+
+/* 栈检查状态保存/恢复（与帧链摘接配对；恢复时还原让锁前的栈基准，
+ * 不做 update_stack_top，防止挂起恢复抬深基准、重发栈预算）。 */
+void qjs_save_stack_check_state(JSContext *ctx, uint64_t *out_top, uint64_t *out_limit);
+void qjs_restore_stack_check_state(JSContext *ctx, uint64_t top, uint64_t limit);
+
 /* Instruction-cache flush helper for generated native code. */
 void qjs_clear_cache(void *start, void *end);
 

@@ -14,10 +14,10 @@ fn parse_pid(s: &str) -> std::result::Result<i32, String> {
 #[command(
     author,
     version,
-    about = "ARM64 Android 动态插桩工具，通过 ptrace 注入 agent.so，支持 QuickJS 脚本/inline hook/Frida Stalker",
+    about = "ARM64 Android 动态插桩工具，通过 ptrace 注入 agent.so，支持 QuickJS 脚本/inline hook/Stalker 追踪",
     long_about = "\
 ARM64 Android 动态插桩工具。通过 ptrace 注入 agent.so 到目标进程，支持 QuickJS 脚本执行、\
-inline hook、Frida Stalker 追踪等功能。
+inline hook、Stalker 追踪等功能。
 
 常见用法:
   rustfrida --pid 1234                         # 注入到指定 PID

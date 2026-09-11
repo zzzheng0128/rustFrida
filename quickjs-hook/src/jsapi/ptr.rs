@@ -303,6 +303,60 @@ unsafe extern "C" fn native_pointer_to_number(
     ffi::JS_NewBigUint64(ctx, addr)
 }
 
+/// NativePointer.toInt32() implementation (Frida 兼容)
+unsafe extern "C" fn native_pointer_to_int32(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let this_val = JSValue(this);
+    let addr = match get_native_pointer_addr(ctx, this_val) {
+        Some(a) => a,
+        None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
+    };
+    JSValue::int(addr as u32 as i32).raw()
+}
+
+/// NativePointer.toUInt32() implementation (Frida 兼容)
+unsafe extern "C" fn native_pointer_to_uint32(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let this_val = JSValue(this);
+    let addr = match get_native_pointer_addr(ctx, this_val) {
+        Some(a) => a,
+        None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
+    };
+    // u32 可能超过 i32::MAX，用 f64 保持无符号语义（<= 2^32 精确）
+    JSValue::float(addr as u32 as f64).raw()
+}
+
+/// NativePointer.equals(rhs) implementation (Frida 兼容)
+/// rhs 接受 NativePointer / number / BigInt / hex string。
+unsafe extern "C" fn native_pointer_equals(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let this_val = JSValue(this);
+    let addr = match get_native_pointer_addr(ctx, this_val) {
+        Some(a) => a,
+        None => return ffi::JS_ThrowTypeError(ctx, b"Not a NativePointer\0".as_ptr() as *const _),
+    };
+    if argc < 1 {
+        return JSValue::bool(false).raw();
+    }
+    let other = match parse_offset(ctx, JSValue(*argv)) {
+        Ok(v) => v as u64,
+        Err(exc) => return exc,
+    };
+    JSValue::bool(addr == other).raw()
+}
+
 /// Register ptr() function and NativePointer class
 pub fn register_ptr(ctx: &JSContext) {
     let class_id = get_or_init_class_id(ctx.as_ptr());
@@ -324,6 +378,9 @@ pub fn register_ptr(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, proto, "toJSON", native_pointer_to_json, 0);
         add_cfunction_to_object(ctx_ptr, proto, "toNumber", native_pointer_to_number, 0);
         add_cfunction_to_object(ctx_ptr, proto, "toInt", native_pointer_to_number, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "toInt32", native_pointer_to_int32, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "toUInt32", native_pointer_to_uint32, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "equals", native_pointer_equals, 1);
 
         // Frida 兼容: 注册 Memory 读写方法到 NativePointer prototype
         // 支持 ptr.readU32() / ptr.writeU32(val) 调用风格

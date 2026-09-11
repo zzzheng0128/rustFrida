@@ -1,4 +1,5 @@
-//! Memory write operations
+//! 脚本内存写入入口：负责参数转换、错误返回与相关资源登记。
+//! 用户态登记、后端操作和最终回收是不同职责；此模块不实现内核页表算法。
 
 use super::helpers::{get_addr_this_or_arg, write_with_perm};
 use super::writest::extract_bytes;
@@ -19,6 +20,7 @@ fn track_wxshadow_addr(addr: u64) {
 }
 
 pub(crate) fn untrack_wxshadow_addr(addr: u64) {
+    // 只移除本地登记，不执行后端释放；调用方须保证两侧状态的生命周期一致。
     let mut guard = WXSHADOW_PATCH_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = guard.as_mut() {
         set.remove(&addr);
@@ -29,6 +31,8 @@ pub(crate) fn untrack_wxshadow_addr(addr: u64) {
 /// hook_engine_cleanup 之后调用, 释放内核 shadow 页, 防止 --pid 场景下
 /// agent dlclose 后 patch 残留.
 pub fn cleanup_wxshadow_patches() {
+    // 取出登记集合后离开集合锁，再调用外部后端。这里没有向上层返回逐项清理结果，
+    // 因此函数结束不能单独作为“所有外部资源都已成功回收”的证明。
     let addrs = {
         let mut guard = WXSHADOW_PATCH_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
         guard.take().unwrap_or_default()
@@ -158,7 +162,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
             }) {
                 return ffi::JS_ThrowRangeError(
                     ctx,
-                    b"writeBytes: target page is not writable; call Memory.protect(addr, size, \"rwx\") first, or use writeBytes(bytes, 1)/writest() for stealth code patch\0".as_ptr() as *const _,
+                    b"writeBytes: target page is not writable; call Memory.protect(addr, size, \"rwx\") first, or use writeBytes(bytes, 1)/writest() for code patch\0".as_ptr() as *const _,
                 );
             }
             ffi::hook::hook_flush_cache(addr as *mut _, len);
@@ -172,7 +176,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
             let page_off = (addr & 0xFFF) as usize;
             if page_off + len > 0x2000 {
                 let msg = format!(
-                    "writeBytes(stealth=1): bytes len={} 跨 >2 页 (page_off=0x{:x})，wxshadow 不支持\0",
+                    "writeBytes(mode=1): bytes len={} 跨 >2 页 (page_off=0x{:x})，wxshadow 不支持\0",
                     len, page_off
                 );
                 return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
@@ -187,7 +191,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                     second_len,
                 );
                 if rc2 != 0 {
-                    let msg = format!("writeBytes(stealth=1): wxshadow_patch second-page rc={}\0", rc2);
+                    let msg = format!("writeBytes(mode=1): wxshadow_patch second-page rc={}\0", rc2);
                     return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
                 }
                 let rc1 = ffi::hook::wxshadow_patch(
@@ -197,7 +201,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                 );
                 if rc1 != 0 {
                     ffi::hook::wxshadow_release(second_addr as *mut std::ffi::c_void);
-                    let msg = format!("writeBytes(stealth=1): first-page rc={}, second 已回滚\0", rc1);
+                    let msg = format!("writeBytes(mode=1): first-page rc={}, second 已回滚\0", rc1);
                     return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
                 }
                 ffi::hook::hook_flush_cache(addr as *mut _, len);
@@ -210,7 +214,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                     len,
                 );
                 if rc != 0 {
-                    let msg = format!("writeBytes(stealth=1): wxshadow_patch rc={}\0", rc);
+                    let msg = format!("writeBytes(mode=1): wxshadow_patch rc={}\0", rc);
                     return ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr());
                 }
                 ffi::hook::hook_flush_cache(addr as *mut _, len);
@@ -220,7 +224,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
         }
         other => {
             let msg = format!(
-                "writeBytes: unsupported stealth mode {} (expected 0 or 1; use writest for mode 2)\0",
+                "writeBytes: unsupported mode {} (expected 0 or 1; use writest for mode 2)\0",
                 other
             );
             ffi::JS_ThrowInternalError(ctx, b"%s\0".as_ptr() as *const _, msg.as_ptr())

@@ -1479,7 +1479,7 @@ frida_main (void * user_data)
   FridaUnloadPolicy unload_policy;
   int ctrlfd_for_peer, ctrlfd, agent_codefd, agent_ctrlfd;
 
-  frida_syscall_5 (__NR_prctl, PR_SET_NAME, (size_t) "wwb-loader", 0, 0, 0);
+  frida_syscall_5 (__NR_prctl, PR_SET_NAME, (size_t) "Profile Saver", 0, 0, 0);
 
   frida_memset (&agent_module, 0, sizeof (agent_module));
   thread_id = frida_gettid ();
@@ -1554,13 +1554,13 @@ frida_main (void * user_data)
   if (!frida_send_ready (ctrlfd, libc))
   {
     frida_send_error (ctrlfd, FRIDA_MESSAGE_ERROR_DLOPEN,
-        "frida_send_ready failed", libc);
+        "send_ready failed", libc);
     goto beach;
   }
   if (!frida_receive_ack (ctrlfd, libc))
   {
     frida_send_error (ctrlfd, FRIDA_MESSAGE_ERROR_DLOPEN,
-        "frida_receive_ack failed", libc);
+        "receive_ack failed", libc);
     goto beach;
   }
 

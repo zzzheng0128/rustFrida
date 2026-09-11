@@ -38,7 +38,7 @@ pub fn register_hook_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx.as_ptr(), g, "recompHook", js_recomp_hook, 2);
         add_cfunction_to_object(ctx.as_ptr(), g, "diagAllocNear", js_diag_alloc_near, 1);
         // __nativeCall: 底层 shim，由 JS 侧的 NativeFunction wrapper 调用
-        add_cfunction_to_object(ctx.as_ptr(), g, "__nativeCall", js_native_call, 6);
+        add_cfunction_to_object(ctx.as_ptr(), g, "__nativeCall", js_native_call, 7);
 
         // Hook.NORMAL = 0, Hook.WXSHADOW = 1, Hook.RECOMP = 2
         let hook_obj = ffi::JS_NewObject(ctx.as_ptr());

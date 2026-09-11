@@ -9,7 +9,7 @@ struct Opt {
 
 fn main() -> anyhow::Result<()> {
     unsafe {
-        let _ = libc::prctl(libc::PR_SET_NAME, b"wwb-ldmain\0".as_ptr(), 0, 0, 0);
+        let _ = libc::prctl(libc::PR_SET_NAME, b"ldmain\0".as_ptr(), 0, 0, 0);
     }
 
     env_logger::init();

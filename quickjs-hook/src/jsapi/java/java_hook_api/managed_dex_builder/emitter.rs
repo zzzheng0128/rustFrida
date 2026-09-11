@@ -227,7 +227,7 @@ impl DslBuildContext {
                 existing.field_name.clone(),
             );
         }
-        let field_name = format!("__rf_str{}", self.string_literals.len());
+        let field_name = format!("__rt_str{}", self.string_literals.len());
         self.string_literals.push(GeneratedStringLiteral {
             field_name: field_name.clone(),
             value: value.to_string(),
@@ -247,7 +247,7 @@ impl DslBuildContext {
                 existing.field_name.clone(),
             );
         }
-        let field_name = format!("__rf_counter{}", self.counters.len());
+        let field_name = format!("__rt_counter{}", self.counters.len());
         self.counters.push(GeneratedCounter {
             name: name.to_string(),
             field_name: field_name.clone(),
@@ -270,7 +270,7 @@ impl DslBuildContext {
     fn message_send_method(&self) -> MethodRef {
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_send".to_string(),
+            "__rt_send".to_string(),
             "V".to_string(),
             vec!["I".to_string(), "I".to_string()],
         )
@@ -279,7 +279,7 @@ impl DslBuildContext {
     fn message_send_string_method(&self) -> MethodRef {
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_send_str".to_string(),
+            "__rt_send_str".to_string(),
             "V".to_string(),
             vec!["I".to_string(), "Ljava/lang/String;".to_string()],
         )
@@ -289,7 +289,7 @@ impl DslBuildContext {
         self.uses_direct_buffer_helpers = true;
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_dbb_fill".to_string(),
+            "__rt_dbb_fill".to_string(),
             "I".to_string(),
             vec![
                 "Ljava/nio/ByteBuffer;".to_string(),
@@ -304,7 +304,7 @@ impl DslBuildContext {
         self.uses_direct_buffer_helpers = true;
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_dbb_copy_from_byte_array".to_string(),
+            "__rt_dbb_copy_from_byte_array".to_string(),
             "I".to_string(),
             vec![
                 "Ljava/nio/ByteBuffer;".to_string(),
@@ -320,7 +320,7 @@ impl DslBuildContext {
         self.uses_direct_buffer_helpers = true;
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_dbb_copy_to_byte_array".to_string(),
+            "__rt_dbb_copy_to_byte_array".to_string(),
             "I".to_string(),
             vec![
                 "Ljava/nio/ByteBuffer;".to_string(),
@@ -336,7 +336,7 @@ impl DslBuildContext {
         self.uses_direct_buffer_helpers = true;
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_dbb_capacity".to_string(),
+            "__rt_dbb_capacity".to_string(),
             "I".to_string(),
             vec!["Ljava/nio/ByteBuffer;".to_string()],
         )
@@ -346,7 +346,7 @@ impl DslBuildContext {
         self.uses_direct_buffer_helpers = true;
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_dbb_get_u8".to_string(),
+            "__rt_dbb_get_u8".to_string(),
             "I".to_string(),
             vec!["Ljava/nio/ByteBuffer;".to_string(), "I".to_string()],
         )
@@ -355,7 +355,7 @@ impl DslBuildContext {
     pub(super) fn guard_enter_method(&self) -> MethodRef {
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_guard_enter".to_string(),
+            "__rt_guard_enter".to_string(),
             "V".to_string(),
             Vec::new(),
         )
@@ -364,7 +364,7 @@ impl DslBuildContext {
     pub(super) fn guard_leave_method(&self) -> MethodRef {
         MethodRef::new(
             self.generated_type.clone(),
-            "__rf_guard_leave".to_string(),
+            "__rt_guard_leave".to_string(),
             "V".to_string(),
             Vec::new(),
         )

@@ -1,9 +1,9 @@
-// Interceptor — Frida-compatible API.
+// Interceptor — JS-compatible API.
 //
 // 核心 attach/replace/detachAll/flush 已由 Rust 侧注册为 CFunction。
 // 本文件仅补充 JS 层的 args/retval 代理和 __interceptorEnter/__interceptorLeave helper。
 //
-// 用法（与 Frida 完全一致）：
+// 用法（与 JS 完全一致）：
 //   var listener = Interceptor.attach(addr, {
 //       onEnter(args) {
 //           // args[0..7] = x0..x7 (NativePointer)

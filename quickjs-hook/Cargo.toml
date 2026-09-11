@@ -10,6 +10,8 @@ license = "Apache-2.0"
 default = []
 std = []
 qbdi = []
+# 开启每次执行域进入/退出的站点计数与跨线程事件记录。
+engine-depth-diagnostics = []
 
 [dependencies]
 libc = "0.2"

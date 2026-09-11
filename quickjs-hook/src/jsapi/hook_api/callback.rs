@@ -23,8 +23,12 @@ struct NativeHookFrame {
     orig_called: bool,
 }
 
-// JS 回调在全局引擎锁下串行执行，因此用一个栈保存 native hook 回调状态即可支持嵌套 hook。
-static NATIVE_HOOK_STACK: Mutex<Vec<NativeHookFrame>> = Mutex::new(Vec::new());
+// 同一系统线程上的 native hook 回调严格嵌套（回调返回前不会在本线程弹出外层
+// 记录），但让锁机制允许不同线程的回调交错存活，因此调用记录必须按线程归属：
+// 每线程一条 LIFO 栈，任何线程都取不到其它线程的记录。
+thread_local! {
+    static NATIVE_HOOK_STACK: RefCell<Vec<NativeHookFrame>> = const { RefCell::new(Vec::new()) };
+}
 static IN_FLIGHT_NATIVE_HOOK_CALLBACKS: Mutex<usize> = Mutex::new(0);
 static IN_FLIGHT_NATIVE_HOOK_CALLBACKS_CV: Condvar = Condvar::new();
 
@@ -53,43 +57,62 @@ impl Drop for InFlightNativeHookGuard {
 }
 
 fn push_native_hook_frame(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) {
-    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    stack.push(NativeHookFrame {
-        ctx_ptr: ctx_ptr as usize,
-        trampoline,
-        orig_called: false,
+    NATIVE_HOOK_STACK.with(|s| {
+        s.borrow_mut().push(NativeHookFrame {
+            ctx_ptr: ctx_ptr as usize,
+            trampoline,
+            orig_called: false,
+        });
     });
 }
 
 fn pop_native_hook_frame(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) -> bool {
-    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(frame) = stack.pop() {
-        debug_assert_eq!(frame.ctx_ptr, ctx_ptr as usize);
-        debug_assert_eq!(frame.trampoline, trampoline);
-        frame.orig_called
-    } else {
-        false
-    }
+    NATIVE_HOOK_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        match stack.pop() {
+            Some(frame) => {
+                // 取回的必须是本线程本次调用的记录；不匹配说明内部状态已损坏，
+                // 响亮报告（不能静默继续假装一切正常）。
+                if frame.ctx_ptr != ctx_ptr as usize || frame.trampoline != trampoline {
+                    crate::jsapi::console::output_message(&format!(
+                        "[rustfrida INTERNAL] native hook frame mismatch on pop: \
+                         expected ctx={:#x} tramp={:#x}, got ctx={:#x} tramp={:#x}\n",
+                        ctx_ptr as usize, trampoline, frame.ctx_ptr, frame.trampoline
+                    ));
+                }
+                frame.orig_called
+            }
+            None => {
+                crate::jsapi::console::output_message(
+                    "[rustfrida INTERNAL] native hook frame stack empty on pop\n",
+                );
+                false
+            }
+        }
+    })
 }
 
 fn mark_native_hook_frame_orig_called(ctx_ptr: *mut hook_ffi::HookContext, trampoline: u64) -> bool {
-    let mut stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(frame) = stack
-        .iter_mut()
-        .rfind(|frame| frame.ctx_ptr == ctx_ptr as usize && frame.trampoline == trampoline)
-    {
-        frame.orig_called = true;
-        true
-    } else {
-        false
-    }
+    NATIVE_HOOK_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        if let Some(frame) = stack
+            .iter_mut()
+            .rfind(|frame| frame.ctx_ptr == ctx_ptr as usize && frame.trampoline == trampoline)
+        {
+            frame.orig_called = true;
+            true
+        } else {
+            false
+        }
+    })
 }
 
 fn current_native_hook_frame() -> Option<(*mut hook_ffi::HookContext, u64)> {
-    let stack = NATIVE_HOOK_STACK.lock().unwrap_or_else(|e| e.into_inner());
-    stack
-        .last()
-        .map(|frame| (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline))
+    NATIVE_HOOK_STACK.with(|s| {
+        s.borrow()
+            .last()
+            .map(|frame| (frame.ctx_ptr as *mut hook_ffi::HookContext, frame.trampoline))
+    })
 }
 
 fn native_callback_would_reenter_js_engine() -> bool {
@@ -322,7 +345,10 @@ unsafe extern "C" fn js_native_call_original(
     }
 
     let _ = mark_native_hook_frame_orig_called(ctx_ptr, trampoline);
+    // 原函数可能阻塞（dlopen/IO/锁）或间接触发其它 hook，持引擎锁等待会拖死全局。
+    let yielded = crate::jsapi::callback_util::yield_js_engine_for_external_call();
     let result = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
+    crate::jsapi::callback_util::reacquire_js_engine_after_external_call(ctx, yielded);
 
     // Write result back to HookContext.x[0] so the thunk's final RET returns this value
     (*ctx_ptr).x[0] = result;

@@ -623,6 +623,35 @@ unsafe fn lookup_call_original_method_id(art_method_addr: u64) -> u64 {
     if clone_addr != 0 {
         let declaring_class = std::ptr::read_volatile(art_method_addr as *const u32);
         std::ptr::write_volatile(clone_addr as *mut u32, declaring_class);
+        // clone 是安装期的整体快照，但 ART 只认识原始 ArtMethod——JIT code cache
+        // 回收编译型 JNI stub 后会把原始方法的 ep 重置回共享入口（generic_jni
+        // _trampoline 等），RegisterNatives 重注册 / so 重载会更新 data_。clone 里
+        // 冻结的 ep 随之悬垂：jit-code-cache 槽位被复用后可能变成其他方法的
+        // lazy-resolution stub，以本方法身份 dlsym 失败抛 UnsatisfiedLinkError
+        // （抖音 J.N.MnXVOzVo 实测：跑一段时间后 FATAL，无 tombstone）。
+        // 每次调原前把这两个易失字段与活的原始方法同步：native 方法的 ep 字段
+        // 我们从不自写（independent-code 分支不改 ep；shared native 分支早退），
+        // 任何变化都来自 ART，跟随即安全；Java 方法的降级值
+        // （quick_to_interpreter_bridge）同样是可正常派发的 ART 入口。
+        if let Some(spec) = crate::jsapi::java::jni_core::ART_METHOD_SPEC.get() {
+            let live_data =
+                std::ptr::read_volatile((art_method_addr as usize + spec.data_offset) as *const u64);
+            if live_data != 0 {
+                std::ptr::write_volatile(
+                    (clone_addr as usize + spec.data_offset) as *mut u64,
+                    live_data,
+                );
+            }
+            let live_ep = std::ptr::read_volatile(
+                (art_method_addr as usize + spec.entry_point_offset) as *const u64
+            );
+            if live_ep != 0 {
+                std::ptr::write_volatile(
+                    (clone_addr as usize + spec.entry_point_offset) as *mut u64,
+                    live_ep,
+                );
+            }
+        }
         clone_addr
     } else {
         art_method_addr
@@ -1080,10 +1109,14 @@ unsafe extern "C" fn js_call_original(
     // pointer, not a jobject transition ref. Invoke the relocated quick
     // trampoline with the saved quick registers instead.
     if hook_ctx.x[0] == art_method_addr && quick_trampoline != 0 && native_entry_trampoline == 0 {
+        // quick 原方法同样可能长时间阻塞（gate hook 的 onCreate 就是这条路径），
+        // 与其它外部调用点一样协作式让出引擎锁。
+        let yielded = crate::jsapi::callback_util::yield_js_engine_for_external_call();
         let ret_x0 = hook_ffi::hook_invoke_trampoline(
             ctx_ptr,
             quick_trampoline as *mut std::ffi::c_void,
         );
+        crate::jsapi::callback_util::reacquire_js_engine_after_external_call(ctx, yielded);
         let ret_raw = if matches!(return_type, b'F' | b'D') {
             (*ctx_ptr).d[0]
         } else {
@@ -1100,10 +1133,12 @@ unsafe extern "C" fn js_call_original(
                 b"orig(...args) is not supported for critical native hooks\0".as_ptr() as *const _,
             );
         }
+        let yielded = crate::jsapi::callback_util::yield_js_engine_for_external_call();
         let ret_x0 = hook_ffi::hook_invoke_trampoline(
             ctx_ptr,
             native_entry_trampoline as *mut std::ffi::c_void,
         );
+        crate::jsapi::callback_util::reacquire_js_engine_after_external_call(ctx, yielded);
         let ret_raw = if matches!(return_type, b'F' | b'D') {
             (*ctx_ptr).d[0]
         } else {
@@ -1136,11 +1171,28 @@ unsafe extern "C" fn js_call_original(
 
     if native_entry_trampoline != 0 {
         if let Some(ref jargs) = supplied_jargs {
+            #[cfg(feature = "engine-depth-diagnostics")]
+            {
+                let dump: Vec<String> = jargs
+                    .iter()
+                    .take(8)
+                    .map(|v| format!("{:#x}", v))
+                    .collect();
+                crate::jsapi::console::output_message(&format!(
+                    "[java.args] orig-jni method={:#x} thread={} argc={} x1={:#x} jargs=[{}]\n",
+                    art_method_addr,
+                    crate::current_thread_id_u64(),
+                    argc,
+                    hook_ctx.x[1],
+                    dump.join(",")
+                ));
+            }
             let jargs_ptr = if jargs.is_empty() {
                 std::ptr::null()
             } else {
                 jargs.as_ptr() as *const std::ffi::c_void
             };
+            let yielded = crate::jsapi::callback_util::yield_js_engine_for_external_call();
             let ret_raw = invoke_original_jni(
                 env,
                 art_method_addr,
@@ -1152,14 +1204,17 @@ unsafe extern "C" fn js_call_original(
                 quick_trampoline,
                 use_blr,
             );
+            crate::jsapi::callback_util::reacquire_js_engine_after_external_call(ctx, yielded);
             delete_owned_jvalue_refs(env, &supplied_owned_refs);
             return js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig);
         }
 
+        let yielded = crate::jsapi::callback_util::yield_js_engine_for_external_call();
         let ret_x0 = hook_ffi::hook_invoke_trampoline(
             ctx_ptr,
             native_entry_trampoline as *mut std::ffi::c_void,
         );
+        crate::jsapi::callback_util::reacquire_js_engine_after_external_call(ctx, yielded);
         let ret_raw = if matches!(return_type, b'F' | b'D') {
             (*ctx_ptr).d[0]
         } else {
@@ -1210,6 +1265,7 @@ unsafe extern "C" fn js_call_original(
         }
     }
 
+    let yielded = crate::jsapi::callback_util::yield_js_engine_for_external_call();
     let ret_raw = invoke_original_jni(
         env,
         art_method_addr,
@@ -1221,6 +1277,7 @@ unsafe extern "C" fn js_call_original(
         quick_trampoline,
         use_blr,
     );
+    crate::jsapi::callback_util::reacquire_js_engine_after_external_call(ctx, yielded);
     delete_owned_jvalue_refs(env, &supplied_owned_refs);
 
     js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig)

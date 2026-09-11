@@ -130,6 +130,16 @@ void* hook_install(void* target, void* replacement, int stealth);
 int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void* user_data, int stealth);
 
 /*
+ * Resolve a hook target before attach: libdl public stubs (dlopen/dlsym/...)
+ * are redirected to their __loader_* counterparts so that caller-address
+ * based namespace resolution inside the linker keeps working when the wrap
+ * path (BLR original) is used. Returns `target` unchanged when no redirect
+ * applies. Idempotent. Attach/detach paths should call this BEFORE keying
+ * any registry by address, so registry and engine agree on the real target.
+ */
+void* hook_resolve_target(void* target);
+
+/*
  * Remove a hook
  *
  * @param target        Address that was hooked

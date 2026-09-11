@@ -418,13 +418,13 @@ pub(crate) fn preconfigure_java_stealth_if_declared(session: &Session, script: &
     let sender = session.get_sender().ok_or_else(|| "agent 未连接".to_string())?;
     log_info!("脚本声明 Java.setStealth({})，预配置到 artinit/jsinit 之前", mode);
     session.eval_state.clear();
-    send_command(sender, format!("javastealth {}", mode)).map_err(|e| format!("发送 javastealth 失败: {}", e))?;
+    send_command(sender, format!("javamode {}", mode)).map_err(|e| format!("发送 javamode 失败: {}", e))?;
     match session
         .eval_state
         .recv_timeout(std::time::Duration::from_secs(JAVA_STEALTH_TIMEOUT_SECS))
     {
-        None => Err(format!("等待 javastealth 超时({}s)", JAVA_STEALTH_TIMEOUT_SECS)),
-        Some(Err(e)) => Err(format!("javastealth 失败: {}", e)),
+        None => Err(format!("等待 javamode 超时({}s)", JAVA_STEALTH_TIMEOUT_SECS)),
+        Some(Err(e)) => Err(format!("javamode 失败: {}", e)),
         Some(Ok(_)) => Ok(()),
     }
 }
@@ -448,12 +448,12 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
         ];
         #[cfg(feature = "frida-gum")]
         {
-            v.push(("stalker", "[tid]", "Frida Stalker 追踪 [frida-gum ✓]"));
+            v.push(("stalker", "[tid]", "Stalker 追踪 [gum ✓]"));
             v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移 [frida-gum ✓]"));
         }
         #[cfg(not(feature = "frida-gum"))]
         {
-            v.push(("stalker", "[tid]", "Frida Stalker 追踪 [--features frida-gum 启用]"));
+            v.push(("stalker", "[tid]", "Stalker 追踪 [--features gum 启用]"));
             v.push((
                 "hfl",
                 "<module> <offset>",

@@ -40,7 +40,7 @@ static JAVA_WORKER_NATIVE_RELEASED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_TID: AtomicI32 = AtomicI32::new(0);
 static EXEC_MEM_UNMAPPED: AtomicBool = AtomicBool::new(false);
 static JAVA_WORKER_QUEUE: OnceLock<JavaWorkerQueue> = OnceLock::new();
-static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
+static HOOK_EXEC_VMA_NAME: &[u8] = b"dalvik-jit-code-cache\0";
 
 enum JavaWorkerTask {
     Eval {
@@ -499,6 +499,21 @@ pub fn cleanup() -> bool {
     };
 
     stage("cleanup start", &mut t);
+
+    // ============================================================
+    // Phase 0: 关闭顶层脚本/RPC 新入口，等待在途顶层执行归零。
+    //   必须早于一切 JS 资源释放：挂起的调用（可能正让锁阻塞在外部代码里，
+    //   C 栈上仍挂着 QuickJS 调用帧）仍引用 Runtime 与回调资源。
+    //   等不到就整体保留，不进入后续任何破坏性步骤。
+    // ============================================================
+    if !quickjs_hook::begin_engine_shutdown(std::time::Duration::from_secs(3)) {
+        log_msg("[quickjs] engine shutdown gate: top-level executions still in flight; destructive cleanup skipped\n".to_string());
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
+    stage("phase0 engine_shutdown_gate", &mut t);
+
     let had_java_worker = stop_java_worker();
     if !wait_java_worker_stopped(had_java_worker, 800) {
         log_msg("[quickjs] Java worker native loop still running; destructive cleanup skipped\n".to_string());
@@ -619,7 +634,11 @@ pub fn cleanup() -> bool {
     }
     detach_current_jni_thread();
     stage("phase4 detach_jni_thread", &mut t);
-    cleanup_engine();
+    if !cleanup_engine() {
+        log_msg("[quickjs] cleanup_engine retained engine (top-level still in flight); destructive cleanup skipped\n".to_string());
+        detach_current_jni_thread();
+        return false;
+    }
     stage("phase4 cleanup_engine", &mut t);
     cleanup_wxshadow_patches();
     stage("phase4 cleanup_wxshadow_patches", &mut t);
@@ -705,6 +724,18 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     };
 
     stage("cleanup start (managed-safe unload)", &mut t);
+
+    // Phase 0: 关闭顶层脚本/RPC 新入口，等待在途顶层执行归零。
+    //   与 cleanup() 同一前置协议，必须早于一切 JS 资源释放。
+    //   最终卸载路径：闸门保持关闭，不重开。
+    if !quickjs_hook::begin_engine_shutdown(std::time::Duration::from_secs(3)) {
+        log_msg("[quickjs] managed-safe unload: top-level executions still in flight; destructive cleanup skipped\n".to_string());
+        detach_current_jni_thread();
+        stage("cleanup detach_jni_thread", &mut t);
+        return false;
+    }
+    stage("phase0 engine_shutdown_gate", &mut t);
+
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
     quickjs_hook::recomp::set_cleanup_release_only(false);
     if quickjs_hook::raw_clone_java_executor_hook_active() {
@@ -790,7 +821,11 @@ pub fn cleanup_for_unload_leak_safe() -> bool {
     }
     detach_current_jni_thread();
     stage("phase3 detach_jni_thread", &mut t);
-    cleanup_engine();
+    if !cleanup_engine() {
+        log_msg("[quickjs] cleanup_engine retained engine (top-level still in flight); destructive cleanup skipped\n".to_string());
+        detach_current_jni_thread();
+        return false;
+    }
     stage("phase3 cleanup_engine", &mut t);
 
     log_msg(format!(
@@ -822,6 +857,15 @@ pub fn cleanup_soft() -> Result<(), String> {
         return Err("JS 引擎未初始化".to_string());
     }
 
+    // 交互式软清理在所有返回路径重开入口；最终卸载不使用此 guard。
+    struct ReopenEngineEntry;
+    impl Drop for ReopenEngineEntry {
+        fn drop(&mut self) {
+            quickjs_hook::reopen_engine_entry();
+        }
+    }
+    let _reopen_entry = ReopenEngineEntry;
+
     let t0 = Instant::now();
     let mut t = t0;
     let mut stage = |label: &str, prev: &mut Instant| {
@@ -833,6 +877,13 @@ pub fn cleanup_soft() -> Result<(), String> {
     };
 
     stage("soft cleanup start", &mut t);
+    // 顶层脚本可能在 NativeFunction 中让锁，此时 thunk 计数可以为零。
+    // 必须先等待宿主执行退出，再切断或释放任何 JS hook 资源。
+    if !quickjs_hook::begin_engine_shutdown(std::time::Duration::from_secs(3)) {
+        detach_current_jni_thread();
+        return Err("top-level execution timeout，软清理已放弃，资源保留".to_string());
+    }
+    stage("phase0 engine_shutdown_gate", &mut t);
     quickjs_hook::recomp::set_cleanup_release_only(false);
     set_art_controller_reload_paused(true);
     stage("phase0 pause_art_controller_reload", &mut t);
@@ -868,8 +919,10 @@ pub fn cleanup_soft() -> Result<(), String> {
     stage("phase3 resume_art_controller_reload", &mut t);
     detach_current_jni_thread();
     stage("phase3 detach_jni_thread", &mut t);
+    if !cleanup_engine() {
+        return Err("engine cleanup failed，软清理未完成，拒绝 reload".to_string());
+    }
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    cleanup_engine();
     stage("phase3 cleanup_engine", &mut t);
 
     log_msg(format!(

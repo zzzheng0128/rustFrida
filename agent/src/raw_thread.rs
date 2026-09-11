@@ -401,6 +401,7 @@ unsafe fn find_elf_symbol(data: &[u8], base: usize, wanted: &str) -> Option<usiz
 }
 
 extern "C" fn raw_thread_entry(arg: usize) -> c_int {
+    let _tls_cleanup = crate::pthread_shim::ThreadExitGuard;
     let start = unsafe { &mut *(arg as *mut RawThreadStart) };
     unsafe {
         gum_libc_syscall_4(

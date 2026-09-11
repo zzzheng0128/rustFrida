@@ -234,7 +234,7 @@ void hook_engine_cleanup(void) {
         free_count++;
         if (e->stealth) stealth_free++;
     }
-    hook_log("hook_engine_cleanup: hooks=%d (stealth=%d), free_list=%d (stealth=%d)",
+    hook_log("hook_engine_cleanup: hooks=%d (mode=%d), free_list=%d (mode=%d)",
              hooks_count, stealth_hooks, free_count, stealth_free);
 
     /* Restore each live hook individually.

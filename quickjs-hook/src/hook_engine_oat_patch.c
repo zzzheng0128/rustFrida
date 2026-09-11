@@ -689,13 +689,13 @@ static int apply_oat_inline_patch(
     uintptr_t recomp_addr = 0;
     if (g_stealth_mode == 2) {
         if (!g_recomp_translate) {
-            hook_log("\033[31m[STEALTH 失效] oat_patch recomp 回调未设置 %#lx，拒绝降级 mprotect\033[0m",
+            hook_log("\033[31m[hook] oat_patch recomp 回调未设置 %#lx，拒绝降级 mprotect\033[0m",
                      (unsigned long)patch_addr);
             return -1;
         }
         recomp_addr = g_recomp_translate(patch_addr);
         if (!recomp_addr) {
-            hook_log("\033[31m[STEALTH 失效] oat_patch recomp 翻译失败 %#lx，patch 未安装！\033[0m",
+            hook_log("\033[31m[hook] oat_patch recomp 翻译失败 %#lx，patch 未安装！\033[0m",
                      (unsigned long)patch_addr);
             return -1;
         }
@@ -723,7 +723,7 @@ static int apply_oat_inline_patch(
     *patch_size_out = overwrite;
 
     /* Apply patch */
-    hook_log("[oat_patch] apply: addr=%#lx overwrite=%d stealth_mode=%d",
+    hook_log("[oat_patch] apply: addr=%#lx overwrite=%d mode=%d",
              (unsigned long)patch_addr, overwrite, g_stealth_mode);
     if (recomp_addr) {
         /* Recomp 模式 — exec_pc 已正确设为 recomp_addr */
@@ -737,7 +737,7 @@ static int apply_oat_inline_patch(
     } else if (g_stealth_mode == 1) {
         /* WxShadow 模式 — stealth1 严格: wxshadow 失败拒绝降级 mprotect */
         if (wxshadow_patch((void*)patch_addr, redirect, overwrite) != 0) {
-            hook_log("\033[31m[STEALTH] oat_patch wxshadow 失败 %#lx，拒绝降级 mprotect\033[0m",
+            hook_log("\033[31m[oat_patch] wxshadow 失败 %#lx，拒绝降级 mprotect\033[0m",
                      (unsigned long)patch_addr);
             return -1;
         }
